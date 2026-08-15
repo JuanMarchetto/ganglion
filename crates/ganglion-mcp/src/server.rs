@@ -37,6 +37,15 @@ impl RpcError {
     }
 }
 
+/// Clamp a client-supplied limit: u64::MAX as usize→i64 would wrap negative
+/// at the SQL layer, and a giant limit is a memory-exhaustion lever.
+fn tool_limit(args: &Value) -> usize {
+    args.get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(8)
+        .clamp(1, 100) as usize
+}
+
 fn required_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, String> {
     args.get(field)
         .and_then(Value::as_str)
@@ -267,10 +276,12 @@ impl McpServer {
             }
             "recall" => {
                 let query = required_str(args, "query")?;
-                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
+                let limit = tool_limit(args);
+                // Scoped to this server's agent — readers and writers must
+                // agree on scope or one MCP server reads another's memories.
                 let hits = self
                     .memory
-                    .recall(query, limit, None, None, None)
+                    .recall_for_agents(&[&self.agent_uuid], query, limit, None, None, None)
                     .await
                     .map_err(|e| format!("{e:#}"))?;
                 Ok(json!(hits
@@ -284,10 +295,10 @@ impl McpServer {
             "recall_asof" => {
                 let query = required_str(args, "query")?;
                 let asof = required_str(args, "asof")?;
-                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
+                let limit = tool_limit(args);
                 let hits = self
                     .memory
-                    .recall_asof(query, asof, limit)
+                    .recall_asof(query, asof, limit, Some(&self.agent_uuid))
                     .await
                     .map_err(|e| format!("{e:#}"))?;
                 Ok(json!(hits
@@ -301,7 +312,7 @@ impl McpServer {
                 let key = required_str(args, "key")?;
                 let tl = self
                     .memory
-                    .belief_timeline(key)
+                    .belief_timeline(key, Some(&self.agent_uuid))
                     .await
                     .map_err(|e| format!("{e:#}"))?;
                 Ok(serde_json::to_value(tl).map_err(|e| e.to_string())?)

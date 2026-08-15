@@ -10,9 +10,10 @@ pub mod traits;
 pub mod vector;
 
 pub use cockroach::{
-    BeliefVersion, BeliefWritten, CockroachMemory, Edge, LedgerVerification, RowMismatch,
+    BeliefVersion, BeliefWritten, ChainVerification, CockroachMemory, Edge, LedgerVerification,
+    RowMismatch,
 };
-pub use ledger::{ChainReport, LedgerEntry, verify_chain};
+pub use ledger::{ChainReport, LedgerEntry, SYSTEM_CHAIN, chain_for, row_sha256, verify_chain};
 pub use embeddings::{
     EmbeddingProvider, HashEmbedding, NoopEmbedding, OpenAiEmbedding, create_embedding_provider,
 };

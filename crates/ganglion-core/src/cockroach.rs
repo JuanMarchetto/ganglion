@@ -21,7 +21,8 @@
 
 use crate::embeddings::{EmbeddingProvider, NoopEmbedding};
 use crate::ledger::{
-    self, ChainReport, LedgerEntry, canonical_string, content_sha256, hmac_hex, normalize_params,
+    self, ChainReport, LedgerEntry, SYSTEM_CHAIN, canonical_string, chain_for, content_sha256,
+    hmac_hex, normalize_params, row_sha256,
 };
 use crate::traits::{
     Memory, MemoryCategory, MemoryEntry, MemoryKind, MemoryStats, StoreOptions,
@@ -77,8 +78,174 @@ impl<T: Send + 'static> Drop for DropOnThread<T> {
     }
 }
 
+/// Everything needed to (re)establish a SQL connection. haproxy fronts the
+/// cluster, so a reconnect after a node death lands on a surviving node —
+/// this is the client half of the kill-node story.
+struct ConnFactory {
+    /// Already passed through [`sanitize_dsn`].
+    sanitized_url: String,
+    wants_tls: bool,
+    connect_timeout: Option<Duration>,
+}
+
+impl ConnFactory {
+    fn connect_once(&self) -> Result<Client> {
+        let mut config: postgres::Config = self
+            .sanitized_url
+            .parse()
+            .context("invalid CockroachDB connection URL")?;
+        if let Some(t) = self.connect_timeout {
+            config.connect_timeout(t);
+        }
+        if self.wants_tls {
+            let connector = native_tls::TlsConnector::new().context("failed to build TLS connector")?;
+            config
+                .connect(postgres_native_tls::MakeTlsConnector::new(connector))
+                .context("failed to connect to CockroachDB memory backend (TLS)")
+        } else {
+            config
+                .connect(NoTls)
+                .context("failed to connect to CockroachDB memory backend")
+        }
+    }
+
+    /// Reconnect with backoff. Sized so a node death is survivable: haproxy's
+    /// health check evicts a dead node within a few seconds; total budget here
+    /// is ~15s across 8 attempts.
+    fn connect_with_backoff(&self) -> Result<Client> {
+        let mut last_err = None;
+        for attempt in 0u32..8 {
+            match self.connect_once() {
+                Ok(c) => {
+                    if attempt > 0 {
+                        tracing::info!(attempt, "cockroach reconnect succeeded");
+                    }
+                    return Ok(c);
+                }
+                Err(e) => {
+                    tracing::warn!(attempt, error = %e, "cockroach reconnect attempt failed");
+                    last_err = Some(e);
+                    std::thread::sleep(Duration::from_millis((100u64 << attempt).min(3_000)));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::Error::msg("reconnect failed")))
+    }
+}
+
+/// A self-healing connection pool: N lazy [`Client`] slots plus the recipe to
+/// rebuild any of them. [`SharedConn::run`] retries the caller's closure on a
+/// fresh connection when the failure is connection-level (node died, socket
+/// closed), and never for SQL-level errors.
+///
+/// Why a pool and not one mutexed connection: a single connection serializes
+/// every operation, and a 40001 backoff sleeping inside the caller's closure
+/// would hold that global lock — under a concurrent write load the whole
+/// memory collapses to serial latency. With N slots, a slot sleeping through
+/// its own retry backoff delays only itself. Slot count comes from
+/// `GANGLION_POOL_SIZE` (default 8).
+///
+/// Retry semantics are at-least-once: a write whose ACK was lost may be
+/// re-applied by the closure's own `with_txn_retry` structure on the fresh
+/// connection. Belief writes tolerate this (an extra version, never a lost
+/// one); the chaos suite asserts the stronger invariant that every ACKed
+/// write is durable.
+pub(crate) struct SharedConn {
+    factory: ConnFactory,
+    slots: Vec<Mutex<Option<Client>>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+pub(crate) fn pool_size_from_env() -> usize {
+    std::env::var("GANGLION_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| (1..=64).contains(n))
+        .unwrap_or(8)
+}
+
+impl SharedConn {
+    /// Max reconnect *cycles* per operation (each cycle itself backs off up to
+    /// 8 connection attempts inside [`ConnFactory::connect_with_backoff`]).
+    const MAX_RECONNECT_CYCLES: u32 = 3;
+
+    fn new(factory: ConnFactory, first: Client, size: usize) -> Self {
+        let mut slots = Vec::with_capacity(size.max(1));
+        slots.push(Mutex::new(Some(first)));
+        for _ in 1..size.max(1) {
+            slots.push(Mutex::new(None)); // connected lazily on first use
+        }
+        Self {
+            factory,
+            slots,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn run<T>(&self, mut f: impl FnMut(&mut Client) -> Result<T>) -> Result<T> {
+        // Round-robin slot pick; prefer an uncontended slot so one op sleeping
+        // through a retry backoff doesn't queue unrelated ops behind it.
+        let start = self
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n = self.slots.len();
+        let mut guard = 'pick: {
+            for i in 0..n {
+                if let Some(g) = self.slots[(start + i) % n].try_lock() {
+                    break 'pick g;
+                }
+            }
+            self.slots[start % n].lock()
+        };
+
+        let mut cycles = 0u32;
+        loop {
+            if guard.is_none() {
+                *guard = Some(self.factory.connect_with_backoff()?);
+            }
+            let client = guard.as_mut().expect("connection just ensured");
+            match f(client) {
+                Err(e) if error_is_connection_level(&e) && cycles < Self::MAX_RECONNECT_CYCLES => {
+                    cycles += 1;
+                    tracing::warn!(cycle = cycles, error = %e, "connection-level failure; reconnecting");
+                    // Safe to drop inline: `run` only executes on plain OS
+                    // threads (every caller goes through run_on_os_thread),
+                    // so Client::drop's block_on cannot hit a Tokio runtime.
+                    drop(guard.take());
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+/// Connection-level = the socket/session is gone (retry on a fresh connection
+/// is sound); SQL-level errors (constraint violations, 40001, syntax) must
+/// surface to the caller's own handling instead.
+fn error_is_connection_level(e: &anyhow::Error) -> bool {
+    let Some(pg) = e.downcast_ref::<postgres::Error>() else {
+        return false;
+    };
+    if pg.is_closed() {
+        return true;
+    }
+    if pg.as_db_error().is_some() {
+        return false;
+    }
+    let mut source = std::error::Error::source(pg);
+    while let Some(inner) = source {
+        if inner.is::<std::io::Error>() {
+            return true;
+        }
+        source = inner.source();
+    }
+    // rust-postgres wraps some transport failures in an opaque kind whose
+    // io source is not exposed; the Display string is the documented tell.
+    pg.to_string().contains("error communicating with the server")
+}
+
 pub struct CockroachMemory {
-    client: DropOnThread<Arc<Mutex<Client>>>,
+    client: DropOnThread<Arc<SharedConn>>,
     qualified_table: String,
     qualified_agents: String,
     qualified_ledger: String,
@@ -110,19 +277,32 @@ pub struct BeliefWritten {
     pub ledger_id: i64,
 }
 
-/// Full ledger verification: HMAC chain plus row-content cross-check.
+/// One scope chain's verification result.
+#[derive(Debug, serde::Serialize)]
+pub struct ChainVerification {
+    pub chain_id: String,
+    #[serde(flatten)]
+    pub report: ChainReport,
+}
+
+/// Full ledger verification: per-chain HMAC verification plus row-state
+/// cross-check.
 #[derive(Debug, serde::Serialize)]
 pub struct LedgerVerification {
-    pub chain: ChainReport,
-    /// Memory rows whose current content hash disagrees with the latest
-    /// content-bearing ledger entry for that row — direct SQL tampering.
+    pub chains: Vec<ChainVerification>,
+    /// Memory rows whose current state hash disagrees with the latest ledger
+    /// commitment for that row — direct SQL tampering.
     pub row_mismatches: Vec<RowMismatch>,
     pub rows_checked: usize,
 }
 
 impl LedgerVerification {
     pub fn is_clean(&self) -> bool {
-        self.chain.valid && self.row_mismatches.is_empty()
+        self.chains.iter().all(|c| c.report.valid) && self.row_mismatches.is_empty()
+    }
+
+    pub fn entries_checked(&self) -> usize {
+        self.chains.iter().map(|c| c.report.checked).sum()
     }
 }
 
@@ -170,7 +350,7 @@ impl CockroachMemory {
         )?;
 
         Ok(Self {
-            client: DropOnThread::new(Arc::new(Mutex::new(client))),
+            client: DropOnThread::new(Arc::new(client)),
             qualified_table,
             qualified_agents,
             qualified_ledger,
@@ -197,41 +377,26 @@ impl CockroachMemory {
         qualified_ledger: String,
         qualified_edges: String,
         dimensions: usize,
-    ) -> Result<Client> {
+    ) -> Result<SharedConn> {
         let init_handle = std::thread::Builder::new()
             .name("cockroach-memory-init".to_string())
-            .spawn(move || -> Result<Client> {
+            .spawn(move || -> Result<SharedConn> {
                 // rust-postgres only parses sslmode=disable|prefer|require.
                 // CockroachDB Cloud hands out verify-full: map it for the
                 // parser; native-tls still verifies the server cert against
                 // system roots (cockroachlabs.cloud uses a public CA).
-                let sanitized_url = sanitize_dsn(&db_url);
-                let mut config: postgres::Config = sanitized_url
-                    .parse()
-                    .context("invalid CockroachDB connection URL")?;
-
-                if let Some(timeout_secs) = connect_timeout_secs {
-                    let bounded = timeout_secs.min(CONNECT_TIMEOUT_CAP_SECS);
-                    config.connect_timeout(Duration::from_secs(bounded));
-                }
-
                 // CockroachDB Cloud requires TLS; local --insecure clusters
                 // don't speak it. Pick by the DSN's sslmode.
-                let wants_tls = ["sslmode=require", "sslmode=verify-ca", "sslmode=verify-full"]
-                    .iter()
-                    .any(|m| db_url.contains(m));
-                let mut client = if wants_tls {
-                    let connector = native_tls::TlsConnector::new()
-                        .context("failed to build TLS connector")?;
-                    config
-                        .connect(postgres_native_tls::MakeTlsConnector::new(connector))
-                        .context("failed to connect to CockroachDB memory backend (TLS)")?
-                } else {
-                    config
-                        .connect(NoTls)
-                        .context("failed to connect to CockroachDB memory backend")?
+                let factory = ConnFactory {
+                    sanitized_url: sanitize_dsn(&db_url),
+                    wants_tls: ["sslmode=require", "sslmode=verify-ca", "sslmode=verify-full"]
+                        .iter()
+                        .any(|m| db_url.contains(m)),
+                    connect_timeout: connect_timeout_secs
+                        .map(|s| Duration::from_secs(s.min(CONNECT_TIMEOUT_CAP_SECS))),
                 };
 
+                let mut client = factory.connect_once()?;
                 Self::init_schema(
                     &mut client,
                     &schema_ident,
@@ -241,7 +406,7 @@ impl CockroachMemory {
                     &qualified_edges,
                     dimensions,
                 )?;
-                Ok(client)
+                Ok(SharedConn::new(factory, client, pool_size_from_env()))
             })
             .context("failed to spawn CockroachDB initializer thread")?;
 
@@ -337,16 +502,18 @@ impl CockroachMemory {
         let ddl_ledger = format!(
             "
             CREATE TABLE IF NOT EXISTS {qualified_ledger} (
-                id         INT8 PRIMARY KEY,
+                chain_id   TEXT NOT NULL,
+                id         INT8 NOT NULL,
                 ts         TIMESTAMPTZ NOT NULL,
                 kind       TEXT NOT NULL,
                 actor      TEXT NOT NULL,
                 target     TEXT NOT NULL,
                 params     JSONB NOT NULL,
                 prev_hmac  TEXT NOT NULL,
-                hmac       TEXT NOT NULL
+                hmac       TEXT NOT NULL,
+                PRIMARY KEY (chain_id, id)
             );
-            CREATE INDEX IF NOT EXISTS idx_ledger_target ON {qualified_ledger}(target, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_ledger_target ON {qualified_ledger}(target, ts DESC);
 
             CREATE TABLE IF NOT EXISTS {qualified_edges} (
                 from_id    TEXT NOT NULL REFERENCES {qualified_table}(id) ON DELETE CASCADE,
@@ -360,6 +527,43 @@ impl CockroachMemory {
         with_txn_retry(|| client.batch_execute(&ddl_ledger))?;
 
         if dimensions > 0 {
+            // The embedding column's dimensionality is frozen at first boot.
+            // Booting later with a different provider (HashEmbedding(32) →
+            // fastembed(384)) would otherwise fail on every single write with
+            // an opaque cast error — check once at init and say it plainly.
+            let col: Option<String> = with_txn_retry(|| {
+                Ok(client
+                    .query(
+                        &format!(
+                            "SELECT data_type FROM [SHOW COLUMNS FROM {qualified_table}]
+                             WHERE column_name = 'embedding'"
+                        ),
+                        &[],
+                    )?
+                    .first()
+                    .map(|r| r.get(0)))
+            })?;
+            match col.as_deref() {
+                None => anyhow::bail!(
+                    "table {qualified_table} exists without an `embedding` column, but the \
+                     configured embedding provider needs VECTOR({dimensions}); migrate the \
+                     table or use a fresh schema"
+                ),
+                Some(t) => {
+                    let existing: Option<usize> = t
+                        .strip_prefix("VECTOR(")
+                        .and_then(|s| s.strip_suffix(')'))
+                        .and_then(|s| s.parse().ok());
+                    if existing != Some(dimensions) {
+                        anyhow::bail!(
+                            "embedding column of {qualified_table} is {t}, but the configured \
+                             embedding provider produces {dimensions} dimensions; drop/migrate \
+                             the table or match the provider to the stored dimensionality"
+                        );
+                    }
+                }
+            }
+
             // C-SPANN distributed vector index. The (tenant_id, agent_id)
             // prefix columns partition the ANN search space per tenant/agent.
             let ddl_vec = format!(
@@ -469,12 +673,13 @@ impl CockroachMemory {
         let qualified_agents = self.qualified_agents.clone();
         let query = normalize_recent_recall_query(query).trim().to_string();
         let query_vec = self.embed_query(&query).await;
-        let sid = session_id.map(str::to_string);
+        // Sanitized on write; sanitize on read or the filter never matches.
+        let sid = session_id.map(sanitize_session_key);
         let since_owned = since.map(str::to_string);
         let until_owned = until.map(str::to_string);
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
+            client.run(|client| {
             let columns = Self::entry_columns();
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
@@ -498,7 +703,12 @@ impl CockroachMemory {
             // because CockroachDB (unlike Postgres) errors on
             // plainto_tsquery('simple', '') — "doesn't contain lexemes" —
             // even inside a short-circuitable CASE/OR.
-            if query.is_empty() && query_vec.is_none() {
+            // Keyword arms run plainto_tsquery('simple', $1), which
+            // ERRORS on a lexeme-free query (punctuation-only) instead of
+            // matching nothing — so a lexeme-free query must never reach
+            // them. Vector recall still works for such queries.
+            let has_lexemes = query.chars().any(char::is_alphanumeric);
+            if !has_lexemes && query_vec.is_none() {
                 let recency_stmt = format!(
                     "
                     SELECT {columns}, 0.0::FLOAT8 AS score
@@ -556,7 +766,9 @@ impl CockroachMemory {
                 ",
             );
 
-            let keyword_rows: Vec<Row> = {
+            let keyword_rows: Vec<Row> = if !has_lexemes {
+                Vec::new()
+            } else {
                 let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     vec![&query, &sid, &limit_i64, &allowed_ref];
                 match (since_owned.as_deref(), until_owned.as_deref()) {
@@ -607,7 +819,7 @@ impl CockroachMemory {
 
             // Recency path (empty query, no vector): keyword_stmt already
             // returned recency-ordered rows with score 0 — pass through.
-            if query.is_empty() && vector_rows.is_empty() {
+            if !has_lexemes && vector_rows.is_empty() {
                 return keyword_rows
                     .iter()
                     .map(Self::row_to_entry)
@@ -652,6 +864,7 @@ impl CockroachMemory {
                     })
                 })
                 .collect())
+            })
         })
         .await
     }
@@ -715,25 +928,33 @@ fn ts_micros_string(ts: &DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-/// Append one ledger entry inside the caller's transaction.
+/// Append one ledger entry inside the caller's transaction, on the given
+/// scope chain.
 ///
-/// Head read + `id = head + 1` PK insert under SERIALIZABLE isolation is the
-/// append serializer (CockroachDB has no advisory locks): two concurrent
-/// appends read the same head, one commits, the other gets 40001 and the
-/// caller's `with_txn_retry` re-runs the whole transaction — mutation and
-/// ledger entry stay atomic across retries by construction.
+/// Per-chain head read + `id = head + 1` PK insert under SERIALIZABLE
+/// isolation is the append serializer (CockroachDB has no advisory locks):
+/// two concurrent appends *to the same chain* read the same head, one
+/// commits, the other gets 40001 and the caller's `with_txn_retry` re-runs
+/// the whole transaction — mutation and ledger entry stay atomic across
+/// retries by construction. Appends to different chains don't contend at
+/// all, which is the point: a single global chain is a hot key that starves
+/// concurrent writers into retry exhaustion.
+#[allow(clippy::too_many_arguments)]
 fn ledger_append_in_tx(
     tx: &mut Transaction<'_>,
     qualified_ledger: &str,
     hmac_key: &[u8],
+    chain_id: &str,
     kind: &str,
     actor: &str,
     target: &str,
     params: serde_json::Value,
 ) -> std::result::Result<i64, postgres::Error> {
     let head = tx.query_opt(
-        &format!("SELECT id, hmac FROM {qualified_ledger} ORDER BY id DESC LIMIT 1"),
-        &[],
+        &format!(
+            "SELECT id, hmac FROM {qualified_ledger} WHERE chain_id = $1 ORDER BY id DESC LIMIT 1"
+        ),
+        &[&chain_id],
     )?;
     let (prev_id, prev_hmac) = match head {
         Some(row) => (row.get::<_, i64>(0), row.get::<_, String>(1)),
@@ -743,14 +964,16 @@ fn ledger_append_in_tx(
     let ts_dt = now_micros();
     let ts = ts_micros_string(&ts_dt);
     let params = normalize_params(&params);
-    let canonical = canonical_string(id, &ts, kind, actor, target, &params, &prev_hmac);
+    let canonical = canonical_string(chain_id, id, &ts, kind, actor, target, &params, &prev_hmac);
     let hmac = hmac_hex(hmac_key, &canonical);
     tx.execute(
         &format!(
-            "INSERT INTO {qualified_ledger} (id, ts, kind, actor, target, params, prev_hmac, hmac)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+            "INSERT INTO {qualified_ledger} (chain_id, id, ts, kind, actor, target, params, prev_hmac, hmac)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
         ),
-        &[&id, &ts_dt, &kind, &actor, &target, &params, &prev_hmac, &hmac],
+        &[
+            &chain_id, &id, &ts_dt, &kind, &actor, &target, &params, &prev_hmac, &hmac,
+        ],
     )?;
     Ok(id)
 }
@@ -906,11 +1129,11 @@ impl CockroachMemory {
         let has_vector = self.dimensions > 0;
 
         run_on_os_thread(move || -> Result<BeliefWritten> {
-            let mut client = client.lock();
+            client.run(|client| {
             let content_hash = content_sha256(&content);
 
             let select_current = format!(
-                "SELECT id FROM {qualified_table}
+                "SELECT id, content, valid_from, importance, pinned FROM {qualified_table}
                  WHERE agent_id = $1 AND key = $2 AND valid_to IS NULL
                  FOR UPDATE"
             );
@@ -954,13 +1177,16 @@ impl CockroachMemory {
                         .get(0),
                 };
 
-                let old_id: Option<String> = tx
+                // Old-row fields feed the closed row's post-supersede hash:
+                // the ledger must commit to the old version's final state
+                // (valid_to = now) or a later valid_to flip would be invisible.
+                let old_row: Option<(String, String, DateTime<Utc>, Option<f64>, bool)> = tx
                     .query_opt(&select_current, &[&agent_uuid, &key])?
-                    .map(|r| r.get(0));
+                    .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)));
 
                 // Strict supersede: no current belief → nothing to correct.
                 // Abort before any write; the dropped tx rolls back.
-                if require_existing && old_id.is_none() {
+                if require_existing && old_row.is_none() {
                     return Ok(None);
                 }
 
@@ -969,6 +1195,10 @@ impl CockroachMemory {
                 // casts); micros so the string round-trips through the DB.
                 let now_s = ts_micros_string(&now_micros());
 
+                let old_id: Option<String> = old_row.as_ref().map(|(id, ..)| id.clone());
+                let superseded_row_sha = old_row.as_ref().map(|(_, c, vf, imp, pin)| {
+                    row_sha256(&key, c, &ts_micros_string(vf), Some(&now_s), *imp, *pin)
+                });
                 if let Some(old) = old_id.as_deref() {
                     tx.execute(&close_old, &[&now_s, &new_id, &old])?;
                 }
@@ -997,17 +1227,21 @@ impl CockroachMemory {
                 }
 
                 let ledger_kind = if old_id.is_some() { "supersede" } else { "store" };
+                let new_row_sha = row_sha256(&key, &content, &now_s, None, importance, pinned);
                 let ledger_id = ledger_append_in_tx(
                     &mut tx,
                     &qualified_ledger,
                     &hmac_key,
+                    &chain_for(&tenant_id, &agent_uuid),
                     ledger_kind,
                     &agent_uuid,
                     &new_id,
                     json!({
                         "key": key,
                         "content_sha256": content_hash,
+                        "row_sha256": new_row_sha,
                         "supersedes": old_id,
+                        "superseded_row_sha256": superseded_row_sha,
                         "source": source,
                         "edges": edges.len(),
                     }),
@@ -1027,25 +1261,36 @@ impl CockroachMemory {
                 superseded_id: old_id,
                 ledger_id,
             })
+            })
         })
         .await
     }
 
-    /// Full version history of a key, oldest first.
-    pub async fn belief_timeline(&self, key: &str) -> Result<Vec<BeliefVersion>> {
+    /// Full version history of a key **for one agent**, oldest first. Two
+    /// agents legitimately hold the same key; an unscoped timeline would
+    /// interleave their chains. `agent_id = None` resolves to the default
+    /// agent, mirroring the write path.
+    pub async fn belief_timeline(
+        &self,
+        key: &str,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<BeliefVersion>> {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
+        let aid = agent_id.map(str::to_string);
 
         run_on_os_thread(move || -> Result<Vec<BeliefVersion>> {
-            let mut client = client.lock();
+            client.run(|client| {
             let stmt = format!(
                 "SELECT id, key, content, source, valid_from, valid_to, superseded_by
                  FROM {qualified_table}
                  WHERE key = $1
+                   AND agent_id = COALESCE($2, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1))
                  ORDER BY valid_from ASC"
             );
-            let rows = client.query(&stmt, &[&key])?;
+            let rows = client.query(&stmt, &[&key, &aid])?;
             Ok(rows
                 .iter()
                 .map(|r| {
@@ -1062,6 +1307,7 @@ impl CockroachMemory {
                     }
                 })
                 .collect())
+            })
         })
         .await
     }
@@ -1079,6 +1325,7 @@ impl CockroachMemory {
         query: &str,
         asof_rfc3339: &str,
         limit: usize,
+        agent_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         // Validate the timestamp before it goes anywhere near SQL.
         let asof: DateTime<Utc> = asof_rfc3339
@@ -1091,16 +1338,25 @@ impl CockroachMemory {
         let qualified_agents = self.qualified_agents.clone();
         let query = normalize_recent_recall_query(query).trim().to_string();
         let query_vec = self.embed_query(&query).await;
+        let aid = agent_id.map(str::to_string);
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
+            client.run(|client| {
             let columns = CockroachMemory::entry_columns();
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
+            // $4: optional agent scope — readers must be scopeable or one
+            // MCP server can read another agent's memories.
             let window = "m.valid_from <= $2::TEXT::TIMESTAMPTZ
-                          AND (m.valid_to IS NULL OR m.valid_to > $2::TEXT::TIMESTAMPTZ)";
+                          AND (m.valid_to IS NULL OR m.valid_to > $2::TEXT::TIMESTAMPTZ)
+                          AND ($4::TEXT IS NULL OR m.agent_id = $4)";
 
-            if query.is_empty() && query_vec.is_none() {
+            // Keyword arms run plainto_tsquery('simple', $1), which
+            // ERRORS on a lexeme-free query (punctuation-only) instead of
+            // matching nothing — so a lexeme-free query must never reach
+            // them. Vector recall still works for such queries.
+            let has_lexemes = query.chars().any(char::is_alphanumeric);
+            if !has_lexemes && query_vec.is_none() {
                 let stmt = format!(
                     "SELECT {columns}, 0.0::FLOAT8 AS score
                      FROM {qualified_table} m
@@ -1109,7 +1365,7 @@ impl CockroachMemory {
                      ORDER BY m.valid_from DESC
                      LIMIT $3"
                 );
-                let rows = client.query(&stmt, &[&query, &asof_s, &limit_i64])?;
+                let rows = client.query(&stmt, &[&query, &asof_s, &limit_i64, &aid])?;
                 return rows
                     .iter()
                     .map(CockroachMemory::row_to_entry)
@@ -1133,10 +1389,10 @@ impl CockroachMemory {
                  ORDER BY score DESC, m.valid_from DESC
                  LIMIT $3"
             );
-            let keyword_rows: Vec<Row> = if query.is_empty() {
+            let keyword_rows: Vec<Row> = if !has_lexemes {
                 Vec::new()
             } else {
-                client.query(&keyword_stmt, &[&query, &asof_s, &limit_i64])?
+                client.query(&keyword_stmt, &[&query, &asof_s, &limit_i64, &aid])?
             };
 
             let vector_rows: Vec<Row> = if let Some(qv) = query_vec.as_ref() {
@@ -1150,7 +1406,7 @@ impl CockroachMemory {
                      ORDER BY m.embedding <=> $1::TEXT::vector
                      LIMIT $3"
                 );
-                client.query(&stmt, &[&qlit, &asof_s, &limit_i64])?
+                client.query(&stmt, &[&qlit, &asof_s, &limit_i64, &aid])?
             } else {
                 Vec::new()
             };
@@ -1191,6 +1447,7 @@ impl CockroachMemory {
                     })
                 })
                 .collect())
+            })
         })
         .await
     }
@@ -1221,7 +1478,7 @@ impl CockroachMemory {
         let key = key.to_string();
 
         run_on_os_thread(move || -> Result<Option<MemoryEntry>> {
-            let mut client = client.lock();
+            client.run(|client| {
             // No agents JOIN: AS OF SYSTEM TIME applies per-statement and the
             // single-table form is the one CockroachDB documents.
             let stmt = format!(
@@ -1235,106 +1492,185 @@ impl CockroachMemory {
             );
             let row = client.query_opt(&stmt, &[&key])?;
             row.as_ref().map(CockroachMemory::row_to_entry).transpose()
+            })
         })
         .await
     }
 
-    /// All ledger entries, oldest first.
+    /// All ledger entries, grouped by chain, oldest first within each chain.
     pub async fn ledger_entries(&self) -> Result<Vec<LedgerEntry>> {
         let client = self.client.get().clone();
         let qualified_ledger = self.qualified_ledger.clone();
 
         run_on_os_thread(move || -> Result<Vec<LedgerEntry>> {
-            let mut client = client.lock();
-            let stmt = format!(
-                "SELECT id, ts, kind, actor, target, params, prev_hmac, hmac
-                 FROM {qualified_ledger} ORDER BY id ASC"
-            );
-            let rows = client.query(&stmt, &[])?;
-            Ok(rows
-                .iter()
-                .map(|r| {
-                    let ts: DateTime<Utc> = r.get("ts");
-                    LedgerEntry {
-                        id: r.get("id"),
-                        ts: ts_micros_string(&ts),
-                        kind: r.get("kind"),
-                        actor: r.get("actor"),
-                        target: r.get("target"),
-                        params: r.get("params"),
-                        prev_hmac: r.get("prev_hmac"),
-                        hmac: r.get("hmac"),
-                    }
-                })
-                .collect())
+            client.run(|client| {
+                let stmt = format!(
+                    "SELECT chain_id, id, ts, kind, actor, target, params, prev_hmac, hmac
+                     FROM {qualified_ledger} ORDER BY chain_id ASC, id ASC"
+                );
+                let rows = client.query(&stmt, &[])?;
+                Ok(rows.iter().map(Self::row_to_ledger_entry).collect())
+            })
         })
         .await
     }
 
+    fn row_to_ledger_entry(r: &Row) -> LedgerEntry {
+        let ts: DateTime<Utc> = r.get("ts");
+        LedgerEntry {
+            chain_id: r.get("chain_id"),
+            id: r.get("id"),
+            ts: ts_micros_string(&ts),
+            kind: r.get("kind"),
+            actor: r.get("actor"),
+            target: r.get("target"),
+            params: r.get("params"),
+            prev_hmac: r.get("prev_hmac"),
+            hmac: r.get("hmac"),
+        }
+    }
+
     /// Verify the whole memory against its ledger:
     ///
-    /// 1. **Chain**: recompute every entry's HMAC and linkage — catches any
-    ///    edit to the ledger itself.
-    /// 2. **Row cross-check**: every memory row's `content` hash must equal
-    ///    the `content_sha256` of the *latest* content-bearing ledger entry
-    ///    targeting it — catches direct `UPDATE`s to memory rows that
-    ///    bypassed the write path.
+    /// 1. **Chains**: recompute every entry's HMAC and linkage, per scope
+    ///    chain — catches any edit to the ledger itself, including moving an
+    ///    entry between chains (`chain_id` is signed).
+    /// 2. **Row cross-check**: every memory row's full state hash
+    ///    ([`ledger::row_sha256`]: key, content, validity window, importance,
+    ///    pinned) must equal the hash in the *latest* ledger entry committing
+    ///    to that row — catches direct `UPDATE`s that bypassed the write
+    ///    path, including a `valid_to` flip that "resurrects" a superseded
+    ///    belief without touching `content`.
+    ///
+    /// Ledger and rows are read **in one transaction** — one snapshot. Two
+    /// separate reads would race concurrent legitimate writes and report
+    /// phantom tampering.
     pub async fn verify_ledger(&self) -> Result<LedgerVerification> {
-        let entries = self.ledger_entries().await?;
-        let chain = ledger::verify_chain(&self.hmac_key, &entries);
-
-        // Latest committed content hash per row id.
-        let mut expected: HashMap<String, String> = HashMap::new();
-        for e in &entries {
-            if let Some(sha) = e.params.get("content_sha256").and_then(|v| v.as_str()) {
-                expected.insert(e.target.clone(), sha.to_string());
-            }
-        }
-
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
-        let rows: Vec<(String, String, String)> =
-            run_on_os_thread(move || -> Result<Vec<(String, String, String)>> {
-                let mut client = client.lock();
-                let stmt = format!("SELECT id, key, content FROM {qualified_table}");
-                let rows = client.query(&stmt, &[])?;
-                Ok(rows
-                    .iter()
-                    .map(|r| (r.get(0), r.get(1), r.get(2)))
-                    .collect())
+        let qualified_ledger = self.qualified_ledger.clone();
+        let hmac_key = self.hmac_key.clone();
+
+        run_on_os_thread(move || -> Result<LedgerVerification> {
+            client.run(|client| {
+                type RowState = (String, String, String, Option<f64>, bool, DateTime<Utc>, Option<DateTime<Utc>>);
+                let (entries, rows): (Vec<LedgerEntry>, Vec<RowState>) = with_txn_retry(|| {
+                    let mut tx = client.transaction()?;
+                    let e_stmt = format!(
+                        "SELECT chain_id, id, ts, kind, actor, target, params, prev_hmac, hmac
+                         FROM {qualified_ledger} ORDER BY chain_id ASC, id ASC"
+                    );
+                    let entries: Vec<LedgerEntry> = tx
+                        .query(&e_stmt, &[])?
+                        .iter()
+                        .map(Self::row_to_ledger_entry)
+                        .collect();
+                    let r_stmt = format!(
+                        "SELECT id, key, content, importance, pinned, valid_from, valid_to
+                         FROM {qualified_table}"
+                    );
+                    let rows: Vec<RowState> = tx
+                        .query(&r_stmt, &[])?
+                        .iter()
+                        .map(|r| {
+                            (
+                                r.get(0),
+                                r.get(1),
+                                r.get(2),
+                                r.get(3),
+                                r.get(4),
+                                r.get(5),
+                                r.get(6),
+                            )
+                        })
+                        .collect();
+                    tx.commit()?;
+                    Ok((entries, rows))
+                })?;
+
+                // Per-chain HMAC verification.
+                let mut chains: Vec<ChainVerification> = Vec::new();
+                let mut start = 0usize;
+                while start < entries.len() {
+                    let chain_id = entries[start].chain_id.clone();
+                    let end = entries[start..]
+                        .iter()
+                        .position(|e| e.chain_id != chain_id)
+                        .map_or(entries.len(), |p| start + p);
+                    let report = ledger::verify_chain(&hmac_key, &entries[start..end]);
+                    chains.push(ChainVerification { chain_id, report });
+                    start = end;
+                }
+
+                // Latest committed row hash per row id. RFC 3339 UTC strings
+                // sort lexicographically = chronologically, so `ts` orders
+                // commitments across chains.
+                let mut expected: HashMap<String, (String, String)> = HashMap::new();
+                let mut commit = |id: &str, ts: &str, sha: &str| {
+                    match expected.get(id) {
+                        Some((prev_ts, _)) if prev_ts.as_str() >= ts => {}
+                        _ => {
+                            expected.insert(id.to_string(), (ts.to_string(), sha.to_string()));
+                        }
+                    }
+                };
+                for e in &entries {
+                    if let Some(sha) = e.params.get("row_sha256").and_then(|v| v.as_str()) {
+                        commit(&e.target, &e.ts, sha);
+                    }
+                    if let (Some(old_id), Some(old_sha)) = (
+                        e.params.get("supersedes").and_then(|v| v.as_str()),
+                        e.params
+                            .get("superseded_row_sha256")
+                            .and_then(|v| v.as_str()),
+                    ) {
+                        commit(old_id, &e.ts, old_sha);
+                    }
+                }
+
+                let rows_checked = rows.len();
+                let mut row_mismatches = Vec::new();
+                for (id, key, content, importance, pinned, vf, vt) in rows {
+                    let vt_s = vt.map(|t| ts_micros_string(&t));
+                    let row_sha = row_sha256(
+                        &key,
+                        &content,
+                        &ts_micros_string(&vf),
+                        vt_s.as_deref(),
+                        importance,
+                        pinned,
+                    );
+                    match expected.get(&id) {
+                        None => {
+                            // Row with no ledger commitment at all: inserted
+                            // around the write path — flag it.
+                            row_mismatches.push(RowMismatch {
+                                id,
+                                key,
+                                ledger_sha256: "<no ledger entry>".into(),
+                                row_sha256: row_sha,
+                            });
+                        }
+                        Some((_, ledger_sha)) if ledger_sha != &row_sha => {
+                            row_mismatches.push(RowMismatch {
+                                id,
+                                key,
+                                ledger_sha256: ledger_sha.clone(),
+                                row_sha256: row_sha,
+                            });
+                        }
+                        Some(_) => {}
+                    }
+                }
+
+                Ok(LedgerVerification {
+                    chains,
+                    row_mismatches,
+                    rows_checked,
+                })
             })
-            .await?;
-
-        let rows_checked = rows.len();
-        let mut row_mismatches = Vec::new();
-        for (id, key, content) in rows {
-            let Some(ledger_sha) = expected.get(&id) else {
-                // Row with no ledger entry at all: written before the ledger
-                // existed or inserted around the write path — flag it.
-                row_mismatches.push(RowMismatch {
-                    id,
-                    key,
-                    ledger_sha256: "<no ledger entry>".into(),
-                    row_sha256: content_sha256(&content),
-                });
-                continue;
-            };
-            let row_sha = content_sha256(&content);
-            if &row_sha != ledger_sha {
-                row_mismatches.push(RowMismatch {
-                    id,
-                    key,
-                    ledger_sha256: ledger_sha.clone(),
-                    row_sha256: row_sha,
-                });
-            }
-        }
-
-        Ok(LedgerVerification {
-            chain,
-            row_mismatches,
-            rows_checked,
         })
+        .await
     }
 }
 
@@ -1374,7 +1710,7 @@ impl Memory for CockroachMemory {
         let key = key.to_string();
 
         run_on_os_thread(move || -> Result<Option<MemoryEntry>> {
-            let mut client = client.lock();
+            client.run(|client| {
             let columns = CockroachMemory::entry_columns();
             let stmt = format!(
                 "
@@ -1388,6 +1724,7 @@ impl Memory for CockroachMemory {
 
             let row = client.query_opt(&stmt, &[&key])?;
             row.as_ref().map(CockroachMemory::row_to_entry).transpose()
+            })
         })
         .await
     }
@@ -1400,7 +1737,7 @@ impl Memory for CockroachMemory {
         let agent_id = agent_id.to_string();
 
         run_on_os_thread(move || -> Result<Option<MemoryEntry>> {
-            let mut client = client.lock();
+            client.run(|client| {
             let columns = CockroachMemory::entry_columns();
             let stmt = format!(
                 "
@@ -1414,6 +1751,7 @@ impl Memory for CockroachMemory {
 
             let row = client.query_opt(&stmt, &[&key, &agent_id])?;
             row.as_ref().map(CockroachMemory::row_to_entry).transpose()
+            })
         })
         .await
     }
@@ -1427,10 +1765,10 @@ impl Memory for CockroachMemory {
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let category = category.map(Self::category_to_str);
-        let sid = session_id.map(str::to_string);
+        let sid = session_id.map(sanitize_session_key);
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
+            client.run(|client| {
             let columns = CockroachMemory::entry_columns();
             let stmt = format!(
                 "
@@ -1450,6 +1788,7 @@ impl Memory for CockroachMemory {
             rows.iter()
                 .map(CockroachMemory::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
+            })
         })
         .await
     }
@@ -1462,7 +1801,7 @@ impl Memory for CockroachMemory {
         let key = key.to_string();
 
         run_on_os_thread(move || -> Result<bool> {
-            let mut client = client.lock();
+            client.run(|client| {
             let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1 RETURNING id");
             let deleted = with_txn_retry(|| {
                 let mut tx = client.transaction()?;
@@ -1476,6 +1815,7 @@ impl Memory for CockroachMemory {
                         &mut tx,
                         &qualified_ledger,
                         &hmac_key,
+                        SYSTEM_CHAIN,
                         "forget",
                         "system",
                         "*",
@@ -1487,6 +1827,7 @@ impl Memory for CockroachMemory {
                 Ok(n)
             })?;
             Ok(deleted > 0)
+            })
         })
         .await
     }
@@ -1500,7 +1841,7 @@ impl Memory for CockroachMemory {
         let agent_id = agent_id.to_string();
 
         run_on_os_thread(move || -> Result<bool> {
-            let mut client = client.lock();
+            client.run(|client| {
             let stmt = format!(
                 "DELETE FROM {qualified_table} WHERE key = $1 AND agent_id = $2 RETURNING id"
             );
@@ -1516,6 +1857,7 @@ impl Memory for CockroachMemory {
                         &mut tx,
                         &qualified_ledger,
                         &hmac_key,
+                        SYSTEM_CHAIN,
                         "forget",
                         &agent_id,
                         "*",
@@ -1527,6 +1869,7 @@ impl Memory for CockroachMemory {
                 Ok(n)
             })?;
             Ok(deleted > 0)
+            })
         })
         .await
     }
@@ -1534,13 +1877,38 @@ impl Memory for CockroachMemory {
     async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
+        let qualified_ledger = self.qualified_ledger.clone();
+        let hmac_key = self.hmac_key.clone();
         let namespace = namespace.to_string();
 
         run_on_os_thread(move || -> Result<usize> {
-            let mut client = client.lock();
-            let stmt = format!("DELETE FROM {qualified_table} WHERE namespace = $1");
-            let deleted = with_txn_retry(|| client.execute(&stmt, &[&namespace]))?;
-            usize::try_from(deleted).context("CockroachDB returned an oversized delete count")
+            client.run(|client| {
+            // Mass deletions must be ledgered in the same transaction —
+            // an unledgered purge is indistinguishable from tampering.
+            let stmt =
+                format!("DELETE FROM {qualified_table} WHERE namespace = $1 RETURNING id");
+            let deleted = with_txn_retry(|| {
+                let mut tx = client.transaction()?;
+                let ids: Vec<String> =
+                    tx.query(&stmt, &[&namespace])?.iter().map(|r| r.get(0)).collect();
+                if !ids.is_empty() {
+                    ledger_append_in_tx(
+                        &mut tx,
+                        &qualified_ledger,
+                        &hmac_key,
+                        SYSTEM_CHAIN,
+                        "purge_namespace",
+                        "system",
+                        "*",
+                        json!({ "namespace": namespace, "count": ids.len(), "deleted_ids": ids }),
+                    )?;
+                }
+                let n = ids.len();
+                tx.commit()?;
+                Ok(n)
+            })?;
+            Ok(deleted)
+            })
         })
         .await
     }
@@ -1548,13 +1916,38 @@ impl Memory for CockroachMemory {
     async fn purge_session(&self, session_id: &str) -> Result<usize> {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
-        let session_id = session_id.to_string();
+        let qualified_ledger = self.qualified_ledger.clone();
+        let hmac_key = self.hmac_key.clone();
+        // Sanitized on write, so it must be sanitized on delete too or the
+        // filter silently misses every row (round-trip asymmetry).
+        let session_id = sanitize_session_key(session_id);
 
         run_on_os_thread(move || -> Result<usize> {
-            let mut client = client.lock();
-            let stmt = format!("DELETE FROM {qualified_table} WHERE session_id = $1");
-            let deleted = with_txn_retry(|| client.execute(&stmt, &[&session_id]))?;
-            usize::try_from(deleted).context("CockroachDB returned an oversized delete count")
+            client.run(|client| {
+            let stmt =
+                format!("DELETE FROM {qualified_table} WHERE session_id = $1 RETURNING id");
+            let deleted = with_txn_retry(|| {
+                let mut tx = client.transaction()?;
+                let ids: Vec<String> =
+                    tx.query(&stmt, &[&session_id])?.iter().map(|r| r.get(0)).collect();
+                if !ids.is_empty() {
+                    ledger_append_in_tx(
+                        &mut tx,
+                        &qualified_ledger,
+                        &hmac_key,
+                        SYSTEM_CHAIN,
+                        "purge_session",
+                        "system",
+                        "*",
+                        json!({ "session_id": session_id, "count": ids.len(), "deleted_ids": ids }),
+                    )?;
+                }
+                let n = ids.len();
+                tx.commit()?;
+                Ok(n)
+            })?;
+            Ok(deleted)
+            })
         })
         .await
     }
@@ -1562,15 +1955,41 @@ impl Memory for CockroachMemory {
     async fn purge_session_for_agent(&self, session_id: &str, agent_id: &str) -> Result<usize> {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
-        let session_id = session_id.to_string();
+        let qualified_ledger = self.qualified_ledger.clone();
+        let hmac_key = self.hmac_key.clone();
+        let session_id = sanitize_session_key(session_id);
         let agent_id = agent_id.to_string();
 
         run_on_os_thread(move || -> Result<usize> {
-            let mut client = client.lock();
-            let stmt =
-                format!("DELETE FROM {qualified_table} WHERE session_id = $1 AND agent_id = $2");
-            let deleted = with_txn_retry(|| client.execute(&stmt, &[&session_id, &agent_id]))?;
-            usize::try_from(deleted).context("CockroachDB returned an oversized delete count")
+            client.run(|client| {
+            let stmt = format!(
+                "DELETE FROM {qualified_table} WHERE session_id = $1 AND agent_id = $2 RETURNING id"
+            );
+            let deleted = with_txn_retry(|| {
+                let mut tx = client.transaction()?;
+                let ids: Vec<String> = tx
+                    .query(&stmt, &[&session_id, &agent_id])?
+                    .iter()
+                    .map(|r| r.get(0))
+                    .collect();
+                if !ids.is_empty() {
+                    ledger_append_in_tx(
+                        &mut tx,
+                        &qualified_ledger,
+                        &hmac_key,
+                        SYSTEM_CHAIN,
+                        "purge_session",
+                        &agent_id,
+                        "*",
+                        json!({ "session_id": session_id, "count": ids.len(), "deleted_ids": ids }),
+                    )?;
+                }
+                let n = ids.len();
+                tx.commit()?;
+                Ok(n)
+            })?;
+            Ok(deleted)
+            })
         })
         .await
     }
@@ -1579,15 +1998,37 @@ impl Memory for CockroachMemory {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
+        let qualified_ledger = self.qualified_ledger.clone();
+        let hmac_key = self.hmac_key.clone();
         let alias = agent_alias.to_string();
 
         run_on_os_thread(move || -> Result<usize> {
-            let mut client = client.lock();
+            client.run(|client| {
             let stmt = format!(
-                "DELETE FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
+                "DELETE FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1) RETURNING id"
             );
-            let deleted = with_txn_retry(|| client.execute(&stmt, &[&alias]))?;
-            usize::try_from(deleted).context("CockroachDB returned an oversized delete count")
+            let deleted = with_txn_retry(|| {
+                let mut tx = client.transaction()?;
+                let ids: Vec<String> =
+                    tx.query(&stmt, &[&alias])?.iter().map(|r| r.get(0)).collect();
+                if !ids.is_empty() {
+                    ledger_append_in_tx(
+                        &mut tx,
+                        &qualified_ledger,
+                        &hmac_key,
+                        SYSTEM_CHAIN,
+                        "purge_agent",
+                        &alias,
+                        "*",
+                        json!({ "agent_alias": alias, "count": ids.len(), "deleted_ids": ids }),
+                    )?;
+                }
+                let n = ids.len();
+                tx.commit()?;
+                Ok(n)
+            })?;
+            Ok(deleted)
+            })
         })
         .await
     }
@@ -1599,7 +2040,7 @@ impl Memory for CockroachMemory {
         let alias = agent_alias.to_string();
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
+            client.run(|client| {
             let columns = CockroachMemory::entry_columns();
             let stmt = format!(
                 "
@@ -1614,6 +2055,7 @@ impl Memory for CockroachMemory {
             rows.iter()
                 .map(CockroachMemory::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
+            })
         })
         .await
     }
@@ -1622,11 +2064,13 @@ impl Memory for CockroachMemory {
         let client = self.client.get().clone();
         let qualified_agents = self.qualified_agents.clone();
         let qualified_table = self.qualified_table.clone();
+        let qualified_ledger = self.qualified_ledger.clone();
+        let hmac_key = self.hmac_key.clone();
         let from = from.to_string();
         let to = to.to_string();
 
         run_on_os_thread(move || -> Result<usize> {
-            let mut client = client.lock();
+            client.run(|client| {
             let mut tx = client.transaction()?;
             let to_rows: i64 = tx
                 .query_one(
@@ -1649,8 +2093,23 @@ impl Memory for CockroachMemory {
                 &format!("UPDATE {qualified_agents} SET alias = $2 WHERE alias = $1"),
                 &[&from, &to],
             )?;
+            if updated > 0 {
+                // Attribution changes are mutations too: an unledgered rename
+                // would let history be silently re-attributed.
+                ledger_append_in_tx(
+                    &mut tx,
+                    &qualified_ledger,
+                    &hmac_key,
+                    SYSTEM_CHAIN,
+                    "rename_agent",
+                    "system",
+                    "*",
+                    json!({ "from": from, "to": to }),
+                )?;
+            }
             tx.commit()?;
             usize::try_from(updated).context("CockroachDB returned an oversized update count")
+            })
         })
         .await
     }
@@ -1661,12 +2120,13 @@ impl Memory for CockroachMemory {
         let alias = agent_alias.to_string();
 
         run_on_os_thread(move || -> Result<usize> {
-            let mut client = client.lock();
+            client.run(|client| {
             // Mirrors `rename_agent`: residue is the alias row (0 or 1).
             let stmt = format!("SELECT COUNT(*) FROM {qualified_agents} WHERE alias = $1");
             let row = client.query_one(&stmt, &[&alias])?;
             let count: i64 = row.get(0);
             usize::try_from(count).context("CockroachDB returned an oversized agent count")
+            })
         })
         .await
     }
@@ -1676,21 +2136,26 @@ impl Memory for CockroachMemory {
         let qualified_table = self.qualified_table.clone();
 
         run_on_os_thread(move || -> Result<usize> {
-            let mut client = client.lock();
+            client.run(|client| {
             let stmt = format!("SELECT COUNT(*) FROM {qualified_table}");
             let count: i64 = client.query_one(&stmt, &[])?.get(0);
             let count =
                 usize::try_from(count).context("CockroachDB returned a negative memory count")?;
             Ok(count)
+            })
         })
         .await
     }
 
     async fn health_check(&self) -> bool {
         let client = self.client.get().clone();
-        run_on_os_thread(move || Ok(client.lock().simple_query("SELECT 1").is_ok()))
-            .await
-            .unwrap_or(false)
+        run_on_os_thread(move || {
+            Ok(client
+                .run(|c| c.simple_query("SELECT 1").map_err(anyhow::Error::from))
+                .is_ok())
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> Result<()> {
@@ -1699,16 +2164,35 @@ impl Memory for CockroachMemory {
         }
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
+        let qualified_ledger = self.qualified_ledger.clone();
+        let hmac_key = self.hmac_key.clone();
         let ids: Vec<String> = superseded_ids.to_vec();
         let new_id = new_id.to_string();
 
         run_on_os_thread(move || -> Result<()> {
-            let mut client = client.lock();
+            client.run(|client| {
             let stmt = format!(
                 "UPDATE {qualified_table} SET superseded_by = $1, updated_at = NOW() WHERE id = ANY($2)"
             );
-            with_txn_retry(|| client.execute(&stmt, &[&new_id, &ids]))?;
+            with_txn_retry(|| {
+                let mut tx = client.transaction()?;
+                let updated = tx.execute(&stmt, &[&new_id, &ids])?;
+                if updated > 0 {
+                    ledger_append_in_tx(
+                        &mut tx,
+                        &qualified_ledger,
+                        &hmac_key,
+                        SYSTEM_CHAIN,
+                        "supersede_mark",
+                        "system",
+                        &new_id,
+                        json!({ "superseded_ids": ids, "count": updated }),
+                    )?;
+                }
+                tx.commit()
+            })?;
             Ok(())
+            })
         })
         .await
     }
@@ -1724,7 +2208,7 @@ impl Memory for CockroachMemory {
         let category = category.map(Self::category_to_str);
 
         run_on_os_thread(move || -> Result<u64> {
-            let mut client = client.lock();
+            client.run(|client| {
             let stmt = format!(
                 "SELECT COUNT(*) FROM {qualified_table}
                  WHERE ($1::TEXT IS NULL OR namespace = $1)
@@ -1734,6 +2218,7 @@ impl Memory for CockroachMemory {
                 .query_one(&stmt, &[&namespace.as_deref(), &category.as_deref()])?
                 .get(0);
             u64::try_from(count).context("CockroachDB returned a negative count")
+            })
         })
         .await
     }
@@ -1743,7 +2228,7 @@ impl Memory for CockroachMemory {
         let qualified_table = self.qualified_table.clone();
 
         run_on_os_thread(move || -> Result<MemoryStats> {
-            let mut client = client.lock();
+            client.run(|client| {
             let totals = client.query_one(
                 &format!(
                     "SELECT COUNT(*),
@@ -1778,6 +2263,7 @@ impl Memory for CockroachMemory {
                 superseded_rows: superseded_rows.max(0) as u64,
                 pinned_rows: pinned_rows.max(0) as u64,
                 bytes: 0,
+            })
             })
         })
         .await
@@ -1845,7 +2331,7 @@ impl Memory for CockroachMemory {
 
         let has_vector = self.dimensions > 0;
         run_on_os_thread(move || -> Result<()> {
-            let mut client = client.lock();
+            client.run(|client| {
             // The embedding column only exists when the backend was created
             // with a real embedder. `$14::TEXT::vector` (not `$14::vector`)
             // keeps the wire parameter type TEXT — rust-postgres cannot
@@ -1880,14 +2366,14 @@ impl Memory for CockroachMemory {
                     tenant_id = EXCLUDED.tenant_id,
                     session_id = EXCLUDED.session_id,
                     updated_at = EXCLUDED.updated_at{embedding_upd}
-                RETURNING id
+                RETURNING id, agent_id, valid_from, valid_to
                 "
             );
 
             let id = Uuid::new_v4().to_string();
             let content_hash = content_sha256(&content);
             with_txn_retry(|| {
-                let now = Utc::now();
+                let now = now_micros();
                 let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
                     &id,
                     &tenant_id,
@@ -1907,19 +2393,37 @@ impl Memory for CockroachMemory {
                     params.push(&embedding);
                 }
                 let mut tx = client.transaction()?;
-                let row_id: String = tx.query_one(&stmt, &params)?.get(0);
+                // RETURNING gives the row as stored: on conflict-update the
+                // original valid_from survives, and the ledger hash must
+                // commit to that, not to this call's timestamp.
+                let row = tx.query_one(&stmt, &params)?;
+                let row_id: String = row.get(0);
+                let row_agent: String = row.get(1);
+                let vf: DateTime<Utc> = row.get(2);
+                let vt: Option<DateTime<Utc>> = row.get(3);
+                let vt_s = vt.map(|t| ts_micros_string(&t));
+                let row_sha = row_sha256(
+                    &key,
+                    &content,
+                    &ts_micros_string(&vf),
+                    vt_s.as_deref(),
+                    importance,
+                    pinned,
+                );
                 ledger_append_in_tx(
                     &mut tx,
                     &qualified_ledger,
                     &hmac_key,
+                    &chain_for(&tenant_id, &row_agent),
                     "store",
-                    aid.as_deref().unwrap_or("default"),
+                    &row_agent,
                     &row_id,
-                    json!({ "key": key, "content_sha256": content_hash }),
+                    json!({ "key": key, "content_sha256": content_hash, "row_sha256": row_sha }),
                 )?;
                 tx.commit()
             })?;
             Ok(())
+            })
         })
         .await
     }
@@ -1963,7 +2467,7 @@ impl Memory for CockroachMemory {
         let qualified_agents = self.qualified_agents.clone();
         let alias = alias.to_string();
         run_on_os_thread(move || -> Result<String> {
-            let mut client = client.lock();
+            client.run(|client| {
             let candidate = Uuid::new_v4().to_string();
             let insert = format!(
                 "INSERT INTO {qualified_agents} (id, alias, created_at)
@@ -1978,6 +2482,7 @@ impl Memory for CockroachMemory {
                 )?
                 .get(0);
             Ok(row)
+            })
         })
         .await
     }

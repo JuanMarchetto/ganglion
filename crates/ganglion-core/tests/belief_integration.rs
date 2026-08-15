@@ -80,7 +80,7 @@ async fn supersede_builds_a_chain_and_recall_sees_only_current() {
     assert!(!hits.iter().any(|e| e.id == w1.id), "superseded row leaked into recall");
 
     // Timeline: both versions, closed→open, correctly linked.
-    let tl = m.belief_timeline("favorite_db").await.unwrap();
+    let tl = m.belief_timeline("favorite_db", None).await.unwrap();
     assert_eq!(tl.len(), 2);
     assert_eq!(tl[0].id, w1.id);
     assert_eq!(tl[0].superseded_by.as_deref(), Some(w2.id.as_str()));
@@ -117,18 +117,18 @@ async fn recall_asof_returns_what_was_believed_then() {
         .unwrap();
 
     // As of `between`, the old belief was current.
-    let then = m.recall_asof("deploy region", &between, 10).await.unwrap();
+    let then = m.recall_asof("deploy region", &between, 10, None).await.unwrap();
     assert_eq!(then.len(), 1, "exactly one version valid at t");
     assert!(then[0].content.contains("us-east-1 only"));
 
     // As of now, the new one.
-    let now = m.recall_asof("deploy region", &now_rfc3339(), 10).await.unwrap();
+    let now = m.recall_asof("deploy region", &now_rfc3339(), 10, None).await.unwrap();
     assert_eq!(now.len(), 1);
     assert!(now[0].content.contains("multi-region"));
 
     // Before the first assertion: nothing.
     let before = m
-        .recall_asof("deploy region", "2020-01-01T00:00:00Z", 10)
+        .recall_asof("deploy region", "2020-01-01T00:00:00Z", 10, None)
         .await
         .unwrap();
     assert!(before.is_empty());
@@ -158,7 +158,7 @@ async fn asof_system_time_agrees_with_applicative_window() {
     assert!(mvcc.content.contains("team A"));
 
     // Applicative axis must agree.
-    let app = m.recall_asof("owner service", &t, 10).await.unwrap();
+    let app = m.recall_asof("owner service", &t, 10, None).await.unwrap();
     assert_eq!(app.len(), 1);
     assert!(app[0].content.contains("team A"));
 }
@@ -182,7 +182,7 @@ async fn ledger_chain_is_valid_after_normal_operations() {
     assert_eq!(entries[3].kind, "forget");
 
     let v = m.verify_ledger().await.unwrap();
-    assert!(v.chain.valid, "chain must verify: {:?}", v.chain);
+    assert!(v.chains.iter().all(|c| c.report.valid), "chains must verify: {:?}", v.chains);
     assert!(v.row_mismatches.is_empty(), "no tampering yet: {:?}", v.row_mismatches);
     // k1 was forgotten (row deleted); k2 has two versions (closed + current),
     // both cross-checked against their latest ledger hashes.
@@ -228,7 +228,7 @@ async fn tampering_a_memory_row_is_detected_by_verify() {
     assert!(hit, "tamper UPDATE must land");
 
     let v = m.verify_ledger().await.unwrap();
-    assert!(v.chain.valid, "ledger itself untouched");
+    assert!(v.chains.iter().all(|c| c.report.valid), "ledger itself untouched");
     assert_eq!(v.row_mismatches.len(), 1, "the tampered row is flagged");
     assert_eq!(v.row_mismatches[0].id, w.id);
     assert_eq!(v.row_mismatches[0].key, "api_budget");
@@ -277,8 +277,9 @@ async fn tampering_the_ledger_breaks_the_chain_at_that_id() {
     assert!(hit, "ledger tamper must land");
 
     let v = m.verify_ledger().await.unwrap();
-    assert!(!v.chain.valid);
-    assert_eq!(v.chain.broken_at, Some(2));
+    let broken: Vec<_> = v.chains.iter().filter(|c| !c.report.valid).collect();
+    assert_eq!(broken.len(), 1, "exactly one chain breaks: {:?}", v.chains);
+    assert_eq!(broken[0].report.broken_at, Some(2));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -378,7 +379,7 @@ async fn concurrent_supersedes_of_the_same_key_serialize_via_retry() {
     r1.unwrap();
     r2.unwrap();
 
-    let tl = m.belief_timeline("hot_key").await.unwrap();
+    let tl = m.belief_timeline("hot_key", None).await.unwrap();
     assert_eq!(tl.len(), 3, "v0 + both corrections");
     let open: Vec<_> = tl.iter().filter(|v| v.valid_to.is_none()).collect();
     assert_eq!(open.len(), 1, "exactly one current version after the race");
@@ -388,6 +389,90 @@ async fn concurrent_supersedes_of_the_same_key_serialize_via_retry() {
     }
 
     let v = m.verify_ledger().await.unwrap();
-    assert!(v.chain.valid, "ledger stayed a valid chain through the race");
+    assert!(v.chains.iter().all(|c| c.report.valid), "ledger stayed valid chains through the race");
     assert!(v.row_mismatches.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shifting_a_superseded_versions_validity_window_is_detected() {
+    let m = mem();
+    let w1 = m
+        .store_belief("policy", "refunds allowed", None, None, StoreOptions::default(), &[])
+        .await
+        .unwrap();
+    tick();
+    m.store_belief("policy", "refunds forbidden", None, None, StoreOptions::default(), &[])
+        .await
+        .unwrap();
+
+    // Attacker falsifies WHEN the correction happened — `content` untouched,
+    // so a content-only cross-check would pass. The row-state hash must not.
+    let old_id = w1.id.clone();
+    let hit = with_raw_client(move |client| {
+        let schemas = client
+            .query(
+                "SELECT table_schema FROM information_schema.tables WHERE table_name = 'memories'",
+                &[],
+            )
+            .unwrap();
+        let mut hit = false;
+        for row in schemas {
+            let schema: String = row.get(0);
+            let n = client
+                .execute(
+                    &format!(
+                        "UPDATE \"{schema}\".memories SET valid_to = valid_to - INTERVAL '1 hour' WHERE id = $1"
+                    ),
+                    &[&old_id],
+                )
+                .unwrap_or(0);
+            if n > 0 {
+                hit = true;
+            }
+        }
+        hit
+    })
+    .await;
+    assert!(hit, "valid_to tamper must land");
+
+    let v = m.verify_ledger().await.unwrap();
+    assert!(
+        v.chains.iter().all(|c| c.report.valid),
+        "ledger itself untouched"
+    );
+    assert!(
+        v.row_mismatches.iter().any(|r| r.id == w1.id),
+        "window-shifted row must be flagged: {:?}",
+        v.row_mismatches
+    );
+    assert!(!v.is_clean());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dimension_mismatch_at_boot_fails_loudly_not_per_write() {
+    let schema = unique_schema();
+    let m32 = CockroachMemory::new(
+        &dsn(),
+        &schema,
+        "memories",
+        Some(15),
+        Some(Arc::new(HashEmbedding::new(32))),
+    )
+    .expect("first boot at 32 dims");
+    drop(m32);
+
+    let err = CockroachMemory::new(
+        &dsn(),
+        &schema,
+        "memories",
+        Some(15),
+        Some(Arc::new(HashEmbedding::new(16))),
+    )
+    .err()
+    .expect("second boot at 16 dims must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("VECTOR(32)") && msg.contains("16 dimensions"),
+        "diagnostic must name both dimensionalities: {msg}"
+    );
 }

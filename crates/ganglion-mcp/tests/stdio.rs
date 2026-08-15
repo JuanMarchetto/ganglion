@@ -145,7 +145,9 @@ fn full_session_over_stdio() {
     // Ledger is clean.
     let v = s.tool(8, "verify_ledger", serde_json::json!({}));
     assert_eq!(v["clean"], true, "ledger not clean: {v}");
-    assert_eq!(v["chain"]["valid"], true);
+    let chains = v["chains"].as_array().unwrap();
+    assert!(!chains.is_empty());
+    assert!(chains.iter().all(|c| c["valid"] == true), "all chains valid: {v}");
 
     // Forget is ledgered and removes the chain.
     let f = s.tool(9, "forget", serde_json::json!({ "key": "release_day" }));

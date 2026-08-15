@@ -9,12 +9,16 @@
 //! appends both read the same head, one commits, the other surfaces 40001
 //! and is retried by `with_txn_retry`.
 //!
-//! Every memory mutation (store / supersede / forget / purge) appends one
-//! entry *in the same transaction* as the mutation itself, committing to the
-//! mutated row via `content_sha256` in `params`. Tampering with a ledger row
-//! breaks the HMAC chain at that id; tampering with a memory row's content
-//! makes the row's hash disagree with its latest ledger entry. Both are
-//! caught by [`crate::cockroach::CockroachMemory::verify_ledger`].
+//! Every memory mutation (store / supersede / forget / purge / rename)
+//! appends one entry *in the same transaction* as the mutation itself,
+//! committing to the mutated row via [`row_sha256`] in `params`. Entries
+//! chain **per (tenant, agent) scope** ([`chain_for`]; bulk ops use
+//! [`SYSTEM_CHAIN`]) — a global chain would funnel all writers through one
+//! hot head row. Tampering with a ledger row breaks that scope's HMAC chain
+//! at its id; tampering with a memory row (content, but also `valid_to`,
+//! `key`, `importance`, `pinned`) makes the row's hash disagree with its
+//! latest ledger entry. Both are caught by
+//! [`crate::cockroach::CockroachMemory::verify_ledger`].
 
 use hmac::{Hmac, Mac};
 use serde_json::Value;
@@ -22,6 +26,23 @@ use sha2::{Digest, Sha256};
 
 /// Chain anchor for the first entry.
 pub const GENESIS: &str = "genesis";
+
+/// Chain for mutations with no tenant/agent scope (bulk purges, renames).
+pub const SYSTEM_CHAIN: &str = "system";
+
+/// Ledger chain id for a (tenant, agent) scope. Ledger entries chain **per
+/// scope**, not globally: a global chain funnels every writer through one
+/// hot head row and, under sustained concurrency, starves writers into
+/// user-visible errors after retry exhaustion — the exact failure the ledger
+/// exists to rule out. Per-scope chains keep the tamper-evidence property
+/// (each scope's history is a complete HMAC chain) without the hot key.
+/// Length-prefixed for injectivity, same argument as [`canonical_string`].
+pub fn chain_for(tenant_id: &str, agent_id: &str) -> String {
+    let mut out = String::with_capacity(tenant_id.len() + agent_id.len() + 8);
+    push_field(&mut out, tenant_id);
+    push_field(&mut out, agent_id);
+    out
+}
 
 /// Environment variable holding the ledger signing key.
 pub const HMAC_KEY_ENV: &str = "GANGLION_HMAC_KEY";
@@ -48,6 +69,9 @@ pub fn key_from_env() -> Vec<u8> {
 /// canonical form (timestamptz stores microseconds, so it round-trips).
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct LedgerEntry {
+    /// Scope chain this entry belongs to ([`chain_for`] / [`SYSTEM_CHAIN`]).
+    /// `id` and `prev_hmac` are per-chain.
+    pub chain_id: String,
     pub id: i64,
     pub ts: String,
     /// Mutation kind: `store` | `supersede` | `forget` | `purge`.
@@ -73,8 +97,11 @@ fn push_field(out: &mut String, s: &str) {
     out.push('|');
 }
 
-/// Canonical byte string covered by the HMAC.
+/// Canonical byte string covered by the HMAC. `chain_id` is part of the
+/// signed material so an entry cannot be spliced into a different chain.
+#[allow(clippy::too_many_arguments)]
 pub fn canonical_string(
+    chain_id: &str,
     id: i64,
     ts: &str,
     kind: &str,
@@ -86,7 +113,8 @@ pub fn canonical_string(
     // serde_json object maps are ordered, so compact serialization is
     // deterministic across the insert and verify paths.
     let params_json = serde_json::to_string(params).unwrap_or_else(|_| "null".to_string());
-    let mut out = String::with_capacity(192);
+    let mut out = String::with_capacity(224);
+    push_field(&mut out, chain_id);
     push_field(&mut out, &id.to_string());
     push_field(&mut out, ts);
     push_field(&mut out, kind);
@@ -99,7 +127,14 @@ pub fn canonical_string(
 
 pub fn entry_canonical(e: &LedgerEntry) -> String {
     canonical_string(
-        e.id, &e.ts, &e.kind, &e.actor, &e.target, &e.params, &e.prev_hmac,
+        &e.chain_id,
+        e.id,
+        &e.ts,
+        &e.kind,
+        &e.actor,
+        &e.target,
+        &e.params,
+        &e.prev_hmac,
     )
 }
 
@@ -132,6 +167,32 @@ pub fn hmac_hex(key: &[u8], msg: &str) -> String {
 /// Hex SHA-256 of a memory row's content — the commitment stored in `params`.
 pub fn content_sha256(content: &str) -> String {
     hex::encode(Sha256::digest(content.as_bytes()))
+}
+
+/// Hex SHA-256 committing to the full tamper-relevant state of a memory row,
+/// not just its `content`: an attacker who flips `valid_to` (resurrecting a
+/// superseded belief), edits `key`, or toggles `pinned`/`importance` changes
+/// this hash. Timestamps must be RFC 3339 **microsecond** strings
+/// (`ts_micros_string`) so the hash survives a database round-trip; `None`
+/// hashes as the empty field. Length-prefixed fields, same injectivity
+/// argument as [`canonical_string`].
+pub fn row_sha256(
+    key: &str,
+    content: &str,
+    valid_from: &str,
+    valid_to: Option<&str>,
+    importance: Option<f64>,
+    pinned: bool,
+) -> String {
+    let mut out = String::with_capacity(160 + content.len());
+    push_field(&mut out, key);
+    push_field(&mut out, content);
+    push_field(&mut out, valid_from);
+    push_field(&mut out, valid_to.unwrap_or(""));
+    let importance_s = importance.map(|f| f.to_string()).unwrap_or_default();
+    push_field(&mut out, &importance_s);
+    push_field(&mut out, if pinned { "true" } else { "false" });
+    hex::encode(Sha256::digest(out.as_bytes()))
 }
 
 /// Chain verification result.
@@ -178,6 +239,7 @@ mod tests {
 
     fn build(id: i64, prev: &str, target: &str, params: Value) -> LedgerEntry {
         let mut e = LedgerEntry {
+            chain_id: chain_for("t1", "agent-1"),
             id,
             ts: format!("2026-08-15T12:00:0{id}.000000Z"),
             kind: "store".into(),
@@ -201,6 +263,7 @@ mod tests {
     #[test]
     fn canonical_string_format_is_pinned() {
         let c = canonical_string(
+            "chain-a",
             7,
             "2026-08-15T12:00:00.000000Z",
             "store",
@@ -211,7 +274,50 @@ mod tests {
         );
         assert_eq!(
             c,
-            "1:7|27:2026-08-15T12:00:00.000000Z|5:store|5:agent|5:row-1|7:{\"x\":1}|7:genesis|"
+            "7:chain-a|1:7|27:2026-08-15T12:00:00.000000Z|5:store|5:agent|5:row-1|7:{\"x\":1}|7:genesis|"
+        );
+    }
+
+    #[test]
+    fn same_entry_in_a_different_chain_has_a_different_hmac() {
+        let chain = chain_of_three();
+        let mut moved = chain[0].clone();
+        moved.chain_id = chain_for("t2", "agent-1");
+        assert_ne!(
+            hmac_hex(KEY, &entry_canonical(&chain[0])),
+            hmac_hex(KEY, &entry_canonical(&moved))
+        );
+    }
+
+    #[test]
+    fn chain_for_is_injective_across_field_boundaries() {
+        assert_ne!(chain_for("ab", "c"), chain_for("a", "bc"));
+    }
+
+    #[test]
+    fn row_sha256_covers_validity_and_flags() {
+        let base = row_sha256("k", "c", "2026-08-15T12:00:00.000000Z", None, None, false);
+        assert_ne!(
+            base,
+            row_sha256(
+                "k",
+                "c",
+                "2026-08-15T12:00:00.000000Z",
+                Some("2026-08-15T13:00:00.000000Z"),
+                None,
+                false
+            ),
+            "valid_to must change the hash"
+        );
+        assert_ne!(
+            base,
+            row_sha256("k", "c", "2026-08-15T12:00:00.000000Z", None, Some(0.5), false),
+            "importance must change the hash"
+        );
+        assert_ne!(
+            base,
+            row_sha256("k", "c", "2026-08-15T12:00:00.000000Z", None, None, true),
+            "pinned must change the hash"
         );
     }
 
@@ -220,6 +326,7 @@ mod tests {
     #[test]
     fn delimiter_in_a_field_cannot_forge_a_matching_canonical_string() {
         let planted = canonical_string(
+            "chain-a",
             5,
             "2026-08-15T12:00:00.000000Z",
             "store",
@@ -229,6 +336,7 @@ mod tests {
             "prev",
         );
         let rewritten = canonical_string(
+            "chain-a",
             5,
             "2026-08-15T12:00:00.000000Z",
             "store",
