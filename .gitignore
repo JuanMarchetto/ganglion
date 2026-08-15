@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+.env
+.env.*
+*.pem
+node_modules/
+.DS_Store
