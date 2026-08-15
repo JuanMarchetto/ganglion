@@ -1,0 +1,47 @@
+services:
+  roach1:
+    image: cockroachdb/cockroach:latest-v26.2
+    hostname: roach1
+    command: start --insecure --join=roach1,roach2,roach3 --listen-addr=0.0.0.0:26257 --advertise-addr=roach1:26257 --http-addr=0.0.0.0:8080
+    volumes:
+      - roach1-data:/cockroach/cockroach-data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  roach2:
+    image: cockroachdb/cockroach:latest-v26.2
+    hostname: roach2
+    command: start --insecure --join=roach1,roach2,roach3 --listen-addr=0.0.0.0:26257 --advertise-addr=roach2:26257 --http-addr=0.0.0.0:8080
+    volumes:
+      - roach2-data:/cockroach/cockroach-data
+    restart: unless-stopped
+
+  roach3:
+    image: cockroachdb/cockroach:latest-v26.2
+    hostname: roach3
+    command: start --insecure --join=roach1,roach2,roach3 --listen-addr=0.0.0.0:26257 --advertise-addr=roach3:26257 --http-addr=0.0.0.0:8080
+    volumes:
+      - roach3-data:/cockroach/cockroach-data
+    restart: unless-stopped
+
+  haproxy:
+    image: haproxy:lts-alpine
+    depends_on:
+      - roach1
+      - roach2
+      - roach3
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "26257:26257"   # SQL (load-balanced across the 3 nodes)
+      - "8085:8080"     # DB Console
+    restart: unless-stopped
+
+volumes:
+  roach1-data:
+  roach2-data:
+  roach3-data:
