@@ -132,7 +132,12 @@ impl CockroachMemory {
         let init_handle = std::thread::Builder::new()
             .name("cockroach-memory-init".to_string())
             .spawn(move || -> Result<Client> {
-                let mut config: postgres::Config = db_url
+                // rust-postgres only parses sslmode=disable|prefer|require.
+                // CockroachDB Cloud hands out verify-full: map it for the
+                // parser; native-tls still verifies the server cert against
+                // system roots (cockroachlabs.cloud uses a public CA).
+                let sanitized_url = sanitize_dsn(&db_url);
+                let mut config: postgres::Config = sanitized_url
                     .parse()
                     .context("invalid CockroachDB connection URL")?;
 
@@ -141,9 +146,22 @@ impl CockroachMemory {
                     config.connect_timeout(Duration::from_secs(bounded));
                 }
 
-                let mut client = config
-                    .connect(NoTls)
-                    .context("failed to connect to CockroachDB memory backend")?;
+                // CockroachDB Cloud requires TLS; local --insecure clusters
+                // don't speak it. Pick by the DSN's sslmode.
+                let wants_tls = ["sslmode=require", "sslmode=verify-ca", "sslmode=verify-full"]
+                    .iter()
+                    .any(|m| db_url.contains(m));
+                let mut client = if wants_tls {
+                    let connector = native_tls::TlsConnector::new()
+                        .context("failed to build TLS connector")?;
+                    config
+                        .connect(postgres_native_tls::MakeTlsConnector::new(connector))
+                        .context("failed to connect to CockroachDB memory backend (TLS)")?
+                } else {
+                    config
+                        .connect(NoTls)
+                        .context("failed to connect to CockroachDB memory backend")?
+                };
 
                 Self::init_schema(
                     &mut client,
@@ -169,7 +187,9 @@ impl CockroachMemory {
         qualified_agents: &str,
         dimensions: usize,
     ) -> Result<()> {
-        client.batch_execute(&format!(
+        // Concurrent schema creation contends on shared descriptor tables and
+        // legitimately yields 40001 — every init statement runs under retry.
+        let ddl_agents = format!(
             "
             CREATE SCHEMA IF NOT EXISTS {schema_ident};
 
@@ -179,18 +199,17 @@ impl CockroachMemory {
                 created_at  TIMESTAMPTZ NOT NULL
             );
             "
-        ))?;
+        );
+        with_txn_retry(|| client.batch_execute(&ddl_agents))?;
 
         // Seed the default agent (attribution target when none is given).
         let candidate = Uuid::new_v4().to_string();
-        client.execute(
-            &format!(
-                "INSERT INTO {qualified_agents} (id, alias, created_at)
-                 VALUES ($1, 'default', NOW())
-                 ON CONFLICT (alias) DO NOTHING"
-            ),
-            &[&candidate],
-        )?;
+        let seed = format!(
+            "INSERT INTO {qualified_agents} (id, alias, created_at)
+             VALUES ($1, 'default', NOW())
+             ON CONFLICT (alias) DO NOTHING"
+        );
+        with_txn_retry(|| client.execute(&seed, &[&candidate]))?;
 
         let embedding_column = if dimensions > 0 {
             format!(",\n                embedding VECTOR({dimensions})")
@@ -198,7 +217,7 @@ impl CockroachMemory {
             String::new()
         };
 
-        client.batch_execute(&format!(
+        let ddl_memories = format!(
             "
             CREATE TABLE IF NOT EXISTS {qualified_table} (
                 id            TEXT PRIMARY KEY,
@@ -223,17 +242,19 @@ impl CockroachMemory {
             CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memories_namespace ON {qualified_table}(namespace);
             CREATE INDEX IF NOT EXISTS idx_memories_content_fts ON {qualified_table} USING gin(to_tsvector('simple', content));
-            CREATE INDEX IF NOT EXISTS idx_memories_key_fts ON {qualified_table} USING gin(to_tsvector('simple', key));
+            CREATE INDEX IF NOT EXISTS idx_memories_key_fts ON {qualified_table} USING gin(to_tsvector('simple', translate(key, '_-', '  ')));
             "
-        ))?;
+        );
+        with_txn_retry(|| client.batch_execute(&ddl_memories))?;
 
         if dimensions > 0 {
             // C-SPANN distributed vector index. The (tenant_id, agent_id)
             // prefix columns partition the ANN search space per tenant/agent.
-            client.batch_execute(&format!(
+            let ddl_vec = format!(
                 "CREATE VECTOR INDEX IF NOT EXISTS idx_memories_embedding
                  ON {qualified_table} (tenant_id, agent_id, embedding)"
-            ))?;
+            );
+            with_txn_retry(|| client.batch_execute(&ddl_vec))?;
         }
 
         Ok(())
@@ -343,25 +364,68 @@ impl CockroachMemory {
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
             let columns = Self::entry_columns();
+            #[allow(clippy::cast_possible_wrap)]
+            let limit_i64 = limit as i64;
+            let allowed_ref: Option<&Vec<String>> = allowed_agent_ids.as_ref();
 
-            // Fixed params $1..$4; time bounds appended after.
+            // Fixed params $1..$4; time bounds appended after. The TEXT
+            // double-casts keep the wire parameter types TEXT — rust-postgres
+            // cannot serialize String into timestamptz (same story as vector).
             let agent_filter = " AND ($4::TEXT[] IS NULL OR m.agent_id = ANY($4))";
             let time_filter: String = match (since_owned.as_deref(), until_owned.as_deref()) {
                 (Some(_), Some(_)) => {
-                    " AND m.created_at >= $5::TIMESTAMPTZ AND m.created_at <= $6::TIMESTAMPTZ"
+                    " AND m.created_at >= $5::TEXT::TIMESTAMPTZ AND m.created_at <= $6::TEXT::TIMESTAMPTZ"
                         .into()
                 }
-                (Some(_), None) => " AND m.created_at >= $5::TIMESTAMPTZ".into(),
-                (None, Some(_)) => " AND m.created_at <= $5::TIMESTAMPTZ".into(),
+                (Some(_), None) => " AND m.created_at >= $5::TEXT::TIMESTAMPTZ".into(),
+                (None, Some(_)) => " AND m.created_at <= $5::TEXT::TIMESTAMPTZ".into(),
                 (None, None) => String::new(),
             };
 
+            // Empty query = recency-only recall. This is a dedicated statement
+            // because CockroachDB (unlike Postgres) errors on
+            // plainto_tsquery('simple', '') — "doesn't contain lexemes" —
+            // even inside a short-circuitable CASE/OR.
+            if query.is_empty() && query_vec.is_none() {
+                let recency_stmt = format!(
+                    "
+                    SELECT {columns}, 0.0::FLOAT8 AS score
+                    FROM {qualified_table} m
+                    LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                    WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                      AND ($1 = '' OR true)
+                      {agent_filter}
+                      {time_filter}
+                    ORDER BY m.updated_at DESC
+                    LIMIT $3
+                    ",
+                );
+                let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                    vec![&query, &sid, &limit_i64, &allowed_ref];
+                match (since_owned.as_deref(), until_owned.as_deref()) {
+                    (Some(_), Some(_)) => {
+                        params.push(&since_owned);
+                        params.push(&until_owned);
+                    }
+                    (Some(_), None) => params.push(&since_owned),
+                    (None, Some(_)) => params.push(&until_owned),
+                    (None, None) => {}
+                }
+                let rows = client.query(&recency_stmt, &params)?;
+                return rows
+                    .iter()
+                    .map(Self::row_to_entry)
+                    .collect::<Result<Vec<MemoryEntry>>>();
+            }
+
+            // Keys are frequently snake_case/kebab-case; translate() splits
+            // them into lexemes so "deploy runbook" matches key deploy_runbook.
             let keyword_stmt = format!(
                 "
                 SELECT {columns},
                        (
-                         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
+                         CASE WHEN to_tsvector('simple', translate(m.key, '_-', '  ')) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank(to_tsvector('simple', translate(m.key, '_-', '  ')), plainto_tsquery('simple', $1)) * 2.0
                            ELSE 0.0 END +
                          CASE WHEN to_tsvector('simple', m.content) @@ plainto_tsquery('simple', $1)
                            THEN ts_rank(to_tsvector('simple', m.content), plainto_tsquery('simple', $1))
@@ -370,17 +434,13 @@ impl CockroachMemory {
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE ($2::TEXT IS NULL OR m.session_id = $2)
-                  AND ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
+                  AND to_tsvector('simple', translate(m.key, '_-', '  ') || ' ' || m.content) @@ plainto_tsquery('simple', $1)
                   {agent_filter}
                   {time_filter}
                 ORDER BY score DESC, m.updated_at DESC
                 LIMIT $3
                 ",
             );
-
-            #[allow(clippy::cast_possible_wrap)]
-            let limit_i64 = limit as i64;
-            let allowed_ref: Option<&Vec<String>> = allowed_agent_ids.as_ref();
 
             let keyword_rows: Vec<Row> = {
                 let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> =
@@ -403,14 +463,14 @@ impl CockroachMemory {
                 let vector_stmt = format!(
                     "
                     SELECT {columns},
-                           (1.0 - (m.embedding <=> $1::vector))::FLOAT8 AS score
+                           (1.0 - (m.embedding <=> $1::TEXT::vector))::FLOAT8 AS score
                     FROM {qualified_table} m
                     LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                     WHERE m.embedding IS NOT NULL
                       AND ($2::TEXT IS NULL OR m.session_id = $2)
                       {agent_filter}
                       {time_filter}
-                    ORDER BY m.embedding <=> $1::vector
+                    ORDER BY m.embedding <=> $1::TEXT::vector
                     LIMIT $3
                     ",
                 );
@@ -501,6 +561,54 @@ where
         tracing::error!("CockroachDB operation thread terminated unexpectedly");
         anyhow::Error::msg("CockroachDB operation thread terminated unexpectedly")
     })?
+}
+
+/// CockroachDB's serializable isolation surfaces retryable conflicts as
+/// SQLSTATE 40001 and expects the client to retry the transaction — this is
+/// the documented contract, not an error condition.
+/// <https://www.cockroachlabs.com/docs/stable/transaction-retry-error-reference>
+fn is_retryable(e: &postgres::Error) -> bool {
+    e.code() == Some(&postgres::error::SqlState::T_R_SERIALIZATION_FAILURE)
+}
+
+/// Run a statement (or whole transaction closure) with 40001 retry + backoff.
+fn with_txn_retry<T, F>(mut f: F) -> std::result::Result<T, postgres::Error>
+where
+    F: FnMut() -> std::result::Result<T, postgres::Error>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match f() {
+            Err(e) if is_retryable(&e) && attempt < 7 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(15u64 << attempt));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Make a CockroachDB Cloud DSN palatable to rust-postgres: map
+/// verify-full/verify-ca to require (TLS verification still happens in
+/// native-tls against system roots) and drop options the parser rejects
+/// (`sslrootcert`, ccloud's cluster routing helpers).
+fn sanitize_dsn(db_url: &str) -> String {
+    let Some((base, query)) = db_url.split_once('?') else {
+        return db_url.to_string();
+    };
+    let kept: Vec<String> = query
+        .split('&')
+        .filter(|seg| !seg.starts_with("sslrootcert="))
+        .map(|seg| match seg {
+            "sslmode=verify-full" | "sslmode=verify-ca" => "sslmode=require".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
 }
 
 fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
@@ -653,7 +761,7 @@ impl Memory for CockroachMemory {
         run_on_os_thread(move || -> Result<bool> {
             let mut client = client.lock();
             let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1");
-            let deleted = client.execute(&stmt, &[&key])?;
+            let deleted = with_txn_retry(|| client.execute(&stmt, &[&key]))?;
             Ok(deleted > 0)
         })
         .await
@@ -668,7 +776,7 @@ impl Memory for CockroachMemory {
         run_on_os_thread(move || -> Result<bool> {
             let mut client = client.lock();
             let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1 AND agent_id = $2");
-            let deleted = client.execute(&stmt, &[&key, &agent_id])?;
+            let deleted = with_txn_retry(|| client.execute(&stmt, &[&key, &agent_id]))?;
             Ok(deleted > 0)
         })
         .await
@@ -682,7 +790,7 @@ impl Memory for CockroachMemory {
         run_on_os_thread(move || -> Result<usize> {
             let mut client = client.lock();
             let stmt = format!("DELETE FROM {qualified_table} WHERE namespace = $1");
-            let deleted = client.execute(&stmt, &[&namespace])?;
+            let deleted = with_txn_retry(|| client.execute(&stmt, &[&namespace]))?;
             usize::try_from(deleted).context("CockroachDB returned an oversized delete count")
         })
         .await
@@ -696,7 +804,7 @@ impl Memory for CockroachMemory {
         run_on_os_thread(move || -> Result<usize> {
             let mut client = client.lock();
             let stmt = format!("DELETE FROM {qualified_table} WHERE session_id = $1");
-            let deleted = client.execute(&stmt, &[&session_id])?;
+            let deleted = with_txn_retry(|| client.execute(&stmt, &[&session_id]))?;
             usize::try_from(deleted).context("CockroachDB returned an oversized delete count")
         })
         .await
@@ -712,7 +820,7 @@ impl Memory for CockroachMemory {
             let mut client = client.lock();
             let stmt =
                 format!("DELETE FROM {qualified_table} WHERE session_id = $1 AND agent_id = $2");
-            let deleted = client.execute(&stmt, &[&session_id, &agent_id])?;
+            let deleted = with_txn_retry(|| client.execute(&stmt, &[&session_id, &agent_id]))?;
             usize::try_from(deleted).context("CockroachDB returned an oversized delete count")
         })
         .await
@@ -729,7 +837,7 @@ impl Memory for CockroachMemory {
             let stmt = format!(
                 "DELETE FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
             );
-            let deleted = client.execute(&stmt, &[&alias])?;
+            let deleted = with_txn_retry(|| client.execute(&stmt, &[&alias]))?;
             usize::try_from(deleted).context("CockroachDB returned an oversized delete count")
         })
         .await
@@ -850,7 +958,7 @@ impl Memory for CockroachMemory {
             let stmt = format!(
                 "UPDATE {qualified_table} SET superseded_by = $1, updated_at = NOW() WHERE id = ANY($2)"
             );
-            client.execute(&stmt, &[&new_id, &ids])?;
+            with_txn_retry(|| client.execute(&stmt, &[&new_id, &ids]))?;
             Ok(())
         })
         .await
@@ -948,7 +1056,10 @@ impl Memory for CockroachMemory {
         agent_id: Option<&str>,
     ) -> Result<()> {
         let embedding = if self.dimensions > 0 {
-            match self.embedder.embed_one(content).await {
+            // Embed key + content together: keys carry real semantics
+            // ("deploy_runbook") and must be reachable by vector recall.
+            let embed_text = format!("{key}\n{content}");
+            match self.embedder.embed_one(&embed_text).await {
                 Ok(v) if v.len() == self.dimensions => Some(Self::vector_literal(&v)),
                 Ok(_) => {
                     tracing::warn!("content embedding has wrong dimensionality; storing without");
@@ -981,18 +1092,28 @@ impl Memory for CockroachMemory {
         let pinned = options.pinned;
         let tenant_id = options.tenant_id.unwrap_or_else(|| "default".into());
 
+        let has_vector = self.dimensions > 0;
         run_on_os_thread(move || -> Result<()> {
             let now = Utc::now();
             let mut client = client.lock();
+            // The embedding column only exists when the backend was created
+            // with a real embedder. `$14::TEXT::vector` (not `$14::vector`)
+            // keeps the wire parameter type TEXT — rust-postgres cannot
+            // serialize into CockroachDB's `vector` type directly.
+            let (embedding_col, embedding_val, embedding_upd) = if has_vector {
+                (", embedding", ", $14::TEXT::vector", ",\n                    embedding = EXCLUDED.embedding")
+            } else {
+                ("", "", "")
+            };
             let stmt = format!(
                 "
                 INSERT INTO {qualified_table}
                     (id, tenant_id, agent_id, namespace, key, content, category,
-                     kind, importance, pinned, session_id, created_at, updated_at, embedding)
+                     kind, importance, pinned, session_id, created_at, updated_at{embedding_col})
                 VALUES
                     ($1, $2,
                      COALESCE($3, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)),
-                     $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::vector)
+                     $4, $5, $6, $7, $8, $9, $10, $11, $12, $13{embedding_val})
                 ON CONFLICT (agent_id, key) DO UPDATE SET
                     content = EXCLUDED.content,
                     category = EXCLUDED.category,
@@ -1002,31 +1123,30 @@ impl Memory for CockroachMemory {
                     namespace = EXCLUDED.namespace,
                     tenant_id = EXCLUDED.tenant_id,
                     session_id = EXCLUDED.session_id,
-                    updated_at = EXCLUDED.updated_at,
-                    embedding = EXCLUDED.embedding
+                    updated_at = EXCLUDED.updated_at{embedding_upd}
                 "
             );
 
             let id = Uuid::new_v4().to_string();
-            client.execute(
-                &stmt,
-                &[
-                    &id,
-                    &tenant_id,
-                    &aid,
-                    &namespace,
-                    &key,
-                    &content,
-                    &category,
-                    &kind,
-                    &importance,
-                    &pinned,
-                    &sid,
-                    &now,
-                    &now,
-                    &embedding,
-                ],
-            )?;
+            let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+                &id,
+                &tenant_id,
+                &aid,
+                &namespace,
+                &key,
+                &content,
+                &category,
+                &kind,
+                &importance,
+                &pinned,
+                &sid,
+                &now,
+                &now,
+            ];
+            if has_vector {
+                params.push(&embedding);
+            }
+            with_txn_retry(|| client.execute(&stmt, &params))?;
             Ok(())
         })
         .await
@@ -1073,14 +1193,12 @@ impl Memory for CockroachMemory {
         run_on_os_thread(move || -> Result<String> {
             let mut client = client.lock();
             let candidate = Uuid::new_v4().to_string();
-            client.execute(
-                &format!(
-                    "INSERT INTO {qualified_agents} (id, alias, created_at)
-                     VALUES ($1, $2, NOW())
-                     ON CONFLICT (alias) DO NOTHING"
-                ),
-                &[&candidate, &alias],
-            )?;
+            let insert = format!(
+                "INSERT INTO {qualified_agents} (id, alias, created_at)
+                 VALUES ($1, $2, NOW())
+                 ON CONFLICT (alias) DO NOTHING"
+            );
+            with_txn_retry(|| client.execute(&insert, &[&candidate, &alias]))?;
             let row: String = client
                 .query_one(
                     &format!("SELECT id FROM {qualified_agents} WHERE alias = $1 LIMIT 1"),
