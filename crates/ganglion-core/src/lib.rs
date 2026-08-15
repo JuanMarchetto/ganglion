@@ -1,14 +1,18 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Ganglion core — distributed agent memory on CockroachDB.
+//!
+//! Portions vendored from zeroclaw (MIT OR Apache-2.0); see ATTRIBUTION.md.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod chunker;
+pub mod cockroach;
+pub mod embeddings;
+pub mod traits;
+pub mod vector;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use cockroach::CockroachMemory;
+pub use embeddings::{
+    EmbeddingProvider, HashEmbedding, NoopEmbedding, OpenAiEmbedding, create_embedding_provider,
+};
+pub use traits::{
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryKind, MemoryStats, SemanticSubtype,
+    StoreOptions, normalize_recent_recall_query, sanitize_session_key,
+};
