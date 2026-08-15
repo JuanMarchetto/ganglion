@@ -5,10 +5,14 @@
 pub mod chunker;
 pub mod cockroach;
 pub mod embeddings;
+pub mod ledger;
 pub mod traits;
 pub mod vector;
 
-pub use cockroach::CockroachMemory;
+pub use cockroach::{
+    BeliefVersion, BeliefWritten, CockroachMemory, Edge, LedgerVerification, RowMismatch,
+};
+pub use ledger::{ChainReport, LedgerEntry, verify_chain};
 pub use embeddings::{
     EmbeddingProvider, HashEmbedding, NoopEmbedding, OpenAiEmbedding, create_embedding_provider,
 };

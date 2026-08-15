@@ -20,6 +20,9 @@
 //! before the demo is recorded.
 
 use crate::embeddings::{EmbeddingProvider, NoopEmbedding};
+use crate::ledger::{
+    self, ChainReport, LedgerEntry, canonical_string, content_sha256, hmac_hex, normalize_params,
+};
 use crate::traits::{
     Memory, MemoryCategory, MemoryEntry, MemoryKind, MemoryStats, StoreOptions,
     normalize_recent_recall_query, sanitize_session_key,
@@ -27,9 +30,10 @@ use crate::traits::{
 use crate::vector::hybrid_merge;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 use parking_lot::Mutex;
-use postgres::{Client, NoTls, Row};
+use postgres::{Client, NoTls, Row, Transaction};
+use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,8 +81,57 @@ pub struct CockroachMemory {
     client: DropOnThread<Arc<Mutex<Client>>>,
     qualified_table: String,
     qualified_agents: String,
+    qualified_ledger: String,
+    qualified_edges: String,
     embedder: Arc<dyn EmbeddingProvider>,
     dimensions: usize,
+    hmac_key: Arc<Vec<u8>>,
+}
+
+/// A knowledge-graph edge attached to a belief write, committed in the same
+/// transaction as the belief row itself.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Edge {
+    /// Target memory row id. Enforced by a foreign key: a dangling target
+    /// aborts (and rolls back) the whole hybrid write.
+    pub to_id: String,
+    pub relation: String,
+}
+
+/// Result of a belief write ([`CockroachMemory::store_belief`] /
+/// [`CockroachMemory::supersede_belief`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BeliefWritten {
+    /// Row id of the now-current belief version.
+    pub id: String,
+    /// Row id of the version this write closed, if any.
+    pub superseded_id: Option<String>,
+    /// Ledger entry appended in the same transaction.
+    pub ledger_id: i64,
+}
+
+/// Full ledger verification: HMAC chain plus row-content cross-check.
+#[derive(Debug, serde::Serialize)]
+pub struct LedgerVerification {
+    pub chain: ChainReport,
+    /// Memory rows whose current content hash disagrees with the latest
+    /// content-bearing ledger entry for that row — direct SQL tampering.
+    pub row_mismatches: Vec<RowMismatch>,
+    pub rows_checked: usize,
+}
+
+impl LedgerVerification {
+    pub fn is_clean(&self) -> bool {
+        self.chain.valid && self.row_mismatches.is_empty()
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RowMismatch {
+    pub id: String,
+    pub key: String,
+    pub ledger_sha256: String,
+    pub row_sha256: String,
 }
 
 impl CockroachMemory {
@@ -102,6 +155,8 @@ impl CockroachMemory {
         let table_ident = quote_identifier(table);
         let qualified_table = format!("{schema_ident}.{table_ident}");
         let qualified_agents = format!("{schema_ident}.agents");
+        let qualified_ledger = format!("{schema_ident}.memory_ledger");
+        let qualified_edges = format!("{schema_ident}.memory_edges");
 
         let client = Self::initialize_client(
             db_url.to_string(),
@@ -109,6 +164,8 @@ impl CockroachMemory {
             schema_ident,
             qualified_table.clone(),
             qualified_agents.clone(),
+            qualified_ledger.clone(),
+            qualified_edges.clone(),
             dimensions,
         )?;
 
@@ -116,17 +173,29 @@ impl CockroachMemory {
             client: DropOnThread::new(Arc::new(Mutex::new(client))),
             qualified_table,
             qualified_agents,
+            qualified_ledger,
+            qualified_edges,
             embedder,
             dimensions,
+            hmac_key: Arc::new(ledger::key_from_env()),
         })
     }
 
+    /// Replace the ledger signing key (constructor reads `GANGLION_HMAC_KEY`).
+    pub fn with_hmac_key(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.hmac_key = Arc::new(key.into());
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn initialize_client(
         db_url: String,
         connect_timeout_secs: Option<u64>,
         schema_ident: String,
         qualified_table: String,
         qualified_agents: String,
+        qualified_ledger: String,
+        qualified_edges: String,
         dimensions: usize,
     ) -> Result<Client> {
         let init_handle = std::thread::Builder::new()
@@ -168,6 +237,8 @@ impl CockroachMemory {
                     &schema_ident,
                     &qualified_table,
                     &qualified_agents,
+                    &qualified_ledger,
+                    &qualified_edges,
                     dimensions,
                 )?;
                 Ok(client)
@@ -180,11 +251,14 @@ impl CockroachMemory {
         })?
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn init_schema(
         client: &mut Client,
         schema_ident: &str,
         qualified_table: &str,
         qualified_agents: &str,
+        qualified_ledger: &str,
+        qualified_edges: &str,
         dimensions: usize,
     ) -> Result<()> {
         // Concurrent schema creation contends on shared descriptor tables and
@@ -217,6 +291,10 @@ impl CockroachMemory {
             String::new()
         };
 
+        // Bitemporal belief rows: a key's history is a chain of rows sharing
+        // (agent_id, key); exactly one is *current* (valid_to IS NULL) —
+        // enforced by the partial unique index (verified: CockroachDB v26.2
+        // supports both the partial index and its use as ON CONFLICT arbiter).
         let ddl_memories = format!(
             "
             CREATE TABLE IF NOT EXISTS {qualified_table} (
@@ -232,20 +310,54 @@ impl CockroachMemory {
                 pinned        BOOL NOT NULL DEFAULT false,
                 superseded_by TEXT,
                 session_id    TEXT,
+                source        TEXT,
+                valid_from    TIMESTAMPTZ NOT NULL,
+                valid_to      TIMESTAMPTZ,
                 created_at    TIMESTAMPTZ NOT NULL,
-                updated_at    TIMESTAMPTZ NOT NULL{embedding_column},
-                CONSTRAINT memories_agent_key_uniq UNIQUE (agent_id, key)
+                updated_at    TIMESTAMPTZ NOT NULL{embedding_column}
             );
 
+            CREATE UNIQUE INDEX IF NOT EXISTS memories_current_uniq
+                ON {qualified_table} (agent_id, key) WHERE valid_to IS NULL;
             CREATE INDEX IF NOT EXISTS idx_memories_category ON {qualified_table}(category);
             CREATE INDEX IF NOT EXISTS idx_memories_session_id ON {qualified_table}(session_id);
             CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memories_namespace ON {qualified_table}(namespace);
+            CREATE INDEX IF NOT EXISTS idx_memories_validity ON {qualified_table}(key, valid_from, valid_to);
             CREATE INDEX IF NOT EXISTS idx_memories_content_fts ON {qualified_table} USING gin(to_tsvector('simple', content));
             CREATE INDEX IF NOT EXISTS idx_memories_key_fts ON {qualified_table} USING gin(to_tsvector('simple', translate(key, '_-', '  ')));
             "
         );
         with_txn_retry(|| client.batch_execute(&ddl_memories))?;
+
+        // Tamper-evident ledger + knowledge-graph edges. No advisory locks on
+        // CockroachDB: the head read + PK insert under SERIALIZABLE serializes
+        // appends (concurrent appends conflict, one retries via 40001).
+        // Edge FKs cascade so `forget` can delete versioned rows.
+        let ddl_ledger = format!(
+            "
+            CREATE TABLE IF NOT EXISTS {qualified_ledger} (
+                id         INT8 PRIMARY KEY,
+                ts         TIMESTAMPTZ NOT NULL,
+                kind       TEXT NOT NULL,
+                actor      TEXT NOT NULL,
+                target     TEXT NOT NULL,
+                params     JSONB NOT NULL,
+                prev_hmac  TEXT NOT NULL,
+                hmac       TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ledger_target ON {qualified_ledger}(target, id DESC);
+
+            CREATE TABLE IF NOT EXISTS {qualified_edges} (
+                from_id    TEXT NOT NULL REFERENCES {qualified_table}(id) ON DELETE CASCADE,
+                to_id      TEXT NOT NULL REFERENCES {qualified_table}(id) ON DELETE CASCADE,
+                relation   TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (from_id, relation, to_id)
+            );
+            "
+        );
+        with_txn_retry(|| client.batch_execute(&ddl_ledger))?;
 
         if dimensions > 0 {
             // C-SPANN distributed vector index. The (tenant_id, agent_id)
@@ -394,6 +506,7 @@ impl CockroachMemory {
                     LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                     WHERE ($2::TEXT IS NULL OR m.session_id = $2)
                       AND ($1 = '' OR true)
+                      AND m.valid_to IS NULL
                       {agent_filter}
                       {time_filter}
                     ORDER BY m.updated_at DESC
@@ -435,6 +548,7 @@ impl CockroachMemory {
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE ($2::TEXT IS NULL OR m.session_id = $2)
                   AND to_tsvector('simple', translate(m.key, '_-', '  ') || ' ' || m.content) @@ plainto_tsquery('simple', $1)
+                  AND m.valid_to IS NULL
                   {agent_filter}
                   {time_filter}
                 ORDER BY score DESC, m.updated_at DESC
@@ -468,6 +582,7 @@ impl CockroachMemory {
                     LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                     WHERE m.embedding IS NOT NULL
                       AND ($2::TEXT IS NULL OR m.session_id = $2)
+                      AND m.valid_to IS NULL
                       {agent_filter}
                       {time_filter}
                     ORDER BY m.embedding <=> $1::TEXT::vector
@@ -588,6 +703,58 @@ where
     }
 }
 
+/// Truncate to microseconds: timestamptz stores microseconds and the ledger's
+/// canonical string must survive a round-trip through the database.
+fn now_micros() -> DateTime<Utc> {
+    let now = Utc::now();
+    now.with_nanosecond((now.nanosecond() / 1000) * 1000)
+        .unwrap_or(now)
+}
+
+fn ts_micros_string(ts: &DateTime<Utc>) -> String {
+    ts.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+/// Append one ledger entry inside the caller's transaction.
+///
+/// Head read + `id = head + 1` PK insert under SERIALIZABLE isolation is the
+/// append serializer (CockroachDB has no advisory locks): two concurrent
+/// appends read the same head, one commits, the other gets 40001 and the
+/// caller's `with_txn_retry` re-runs the whole transaction — mutation and
+/// ledger entry stay atomic across retries by construction.
+fn ledger_append_in_tx(
+    tx: &mut Transaction<'_>,
+    qualified_ledger: &str,
+    hmac_key: &[u8],
+    kind: &str,
+    actor: &str,
+    target: &str,
+    params: serde_json::Value,
+) -> std::result::Result<i64, postgres::Error> {
+    let head = tx.query_opt(
+        &format!("SELECT id, hmac FROM {qualified_ledger} ORDER BY id DESC LIMIT 1"),
+        &[],
+    )?;
+    let (prev_id, prev_hmac) = match head {
+        Some(row) => (row.get::<_, i64>(0), row.get::<_, String>(1)),
+        None => (0, ledger::GENESIS.to_string()),
+    };
+    let id = prev_id + 1;
+    let ts_dt = now_micros();
+    let ts = ts_micros_string(&ts_dt);
+    let params = normalize_params(&params);
+    let canonical = canonical_string(id, &ts, kind, actor, target, &params, &prev_hmac);
+    let hmac = hmac_hex(hmac_key, &canonical);
+    tx.execute(
+        &format!(
+            "INSERT INTO {qualified_ledger} (id, ts, kind, actor, target, params, prev_hmac, hmac)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        ),
+        &[&id, &ts_dt, &kind, &actor, &target, &params, &prev_hmac, &hmac],
+    )?;
+    Ok(id)
+}
+
 /// Make a CockroachDB Cloud DSN palatable to rust-postgres: map
 /// verify-full/verify-ca to require (TLS verification still happens in
 /// native-tls against system roots) and drop options the parser rejects
@@ -638,6 +805,539 @@ fn quote_identifier(value: &str) -> String {
     format!("\"{value}\"")
 }
 
+/// One version in a belief's history.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BeliefVersion {
+    pub id: String,
+    pub key: String,
+    pub content: String,
+    pub source: Option<String>,
+    /// RFC 3339. When this version became the current belief.
+    pub valid_from: String,
+    /// RFC 3339. When it stopped being current; `None` = still current.
+    pub valid_to: Option<String>,
+    pub superseded_by: Option<String>,
+}
+
+impl CockroachMemory {
+    /// Versioned "remember": insert the belief if the key has no current
+    /// version, otherwise supersede the current version — never overwrite.
+    ///
+    /// One SERIALIZABLE transaction commits: the new row (with embedding),
+    /// the closing of the previous version, every knowledge-graph edge, and
+    /// the ledger entry. A dangling edge target aborts all of it.
+    pub async fn store_belief(
+        &self,
+        key: &str,
+        content: &str,
+        source: Option<&str>,
+        agent_id: Option<&str>,
+        options: StoreOptions,
+        edges: &[Edge],
+    ) -> Result<BeliefWritten> {
+        self.write_belief(key, content, source, agent_id, options, edges, false)
+            .await
+    }
+
+    /// Correct an existing belief: close the current version and open the new
+    /// one in the same transaction. Errors if the key has no current version
+    /// (you cannot correct a belief that was never held).
+    pub async fn supersede_belief(
+        &self,
+        key: &str,
+        content: &str,
+        source: Option<&str>,
+        agent_id: Option<&str>,
+        options: StoreOptions,
+        edges: &[Edge],
+    ) -> Result<BeliefWritten> {
+        self.write_belief(key, content, source, agent_id, options, edges, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_belief(
+        &self,
+        key: &str,
+        content: &str,
+        source: Option<&str>,
+        agent_id: Option<&str>,
+        options: StoreOptions,
+        edges: &[Edge],
+        require_existing: bool,
+    ) -> Result<BeliefWritten> {
+        let embedding = if self.dimensions > 0 {
+            let embed_text = format!("{key}\n{content}");
+            match self.embedder.embed_one(&embed_text).await {
+                Ok(v) if v.len() == self.dimensions => Some(Self::vector_literal(&v)),
+                Ok(_) => {
+                    tracing::warn!("belief embedding has wrong dimensionality; storing without");
+                    None
+                }
+                Err(err) => {
+                    tracing::warn!("belief embedding failed ({err}); storing without");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let qualified_ledger = self.qualified_ledger.clone();
+        let qualified_edges = self.qualified_edges.clone();
+        let hmac_key = self.hmac_key.clone();
+        let key = key.to_string();
+        let content = content.to_string();
+        let source = source.map(str::to_string);
+        let aid = agent_id.map(str::to_string);
+        let namespace = options.namespace.unwrap_or_else(|| "default".into());
+        let importance = options.importance;
+        let kind_json = options
+            .kind
+            .as_ref()
+            .map(|k| serde_json::to_string(k))
+            .transpose()?;
+        let pinned = options.pinned;
+        let tenant_id = options.tenant_id.unwrap_or_else(|| "default".into());
+        let edges: Vec<Edge> = edges.to_vec();
+        let has_vector = self.dimensions > 0;
+
+        run_on_os_thread(move || -> Result<BeliefWritten> {
+            let mut client = client.lock();
+            let content_hash = content_sha256(&content);
+
+            let select_current = format!(
+                "SELECT id FROM {qualified_table}
+                 WHERE agent_id = $1 AND key = $2 AND valid_to IS NULL
+                 FOR UPDATE"
+            );
+            let close_old = format!(
+                "UPDATE {qualified_table}
+                 SET valid_to = $1::TEXT::TIMESTAMPTZ, superseded_by = $2,
+                     updated_at = $1::TEXT::TIMESTAMPTZ
+                 WHERE id = $3"
+            );
+            let (embedding_col, embedding_val) = if has_vector {
+                (", embedding", ", $15::TEXT::vector")
+            } else {
+                ("", "")
+            };
+            let insert_new = format!(
+                "INSERT INTO {qualified_table}
+                    (id, tenant_id, agent_id, namespace, key, content, category,
+                     kind, importance, pinned, session_id, source,
+                     created_at, updated_at, valid_from{embedding_col})
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11,
+                         $12::TEXT::TIMESTAMPTZ, $12::TEXT::TIMESTAMPTZ,
+                         $12::TEXT::TIMESTAMPTZ{embedding_val})"
+            );
+            let insert_edge = format!(
+                "INSERT INTO {qualified_edges} (from_id, to_id, relation, created_at)
+                 VALUES ($1, $2, $3, NOW())"
+            );
+
+            let written = with_txn_retry(|| {
+                let mut tx = client.transaction()?;
+
+                let agent_uuid: String = match aid.as_deref() {
+                    Some(a) => a.to_string(),
+                    None => tx
+                        .query_one(
+                            &format!(
+                                "SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1"
+                            ),
+                            &[],
+                        )?
+                        .get(0),
+                };
+
+                let old_id: Option<String> = tx
+                    .query_opt(&select_current, &[&agent_uuid, &key])?
+                    .map(|r| r.get(0));
+
+                // Strict supersede: no current belief → nothing to correct.
+                // Abort before any write; the dropped tx rolls back.
+                if require_existing && old_id.is_none() {
+                    return Ok(None);
+                }
+
+                let new_id = Uuid::new_v4().to_string();
+                // TEXT-cast timestamps (same wire-type story as the vector
+                // casts); micros so the string round-trips through the DB.
+                let now_s = ts_micros_string(&now_micros());
+
+                if let Some(old) = old_id.as_deref() {
+                    tx.execute(&close_old, &[&now_s, &new_id, &old])?;
+                }
+
+                let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+                    &new_id,
+                    &tenant_id,
+                    &agent_uuid,
+                    &namespace,
+                    &key,
+                    &content,
+                    &"core",
+                    &kind_json,
+                    &importance,
+                    &pinned,
+                    &source,
+                    &now_s,
+                ];
+                if has_vector {
+                    params.push(&embedding);
+                }
+                tx.execute(&insert_new, &params)?;
+
+                for e in &edges {
+                    tx.execute(&insert_edge, &[&new_id, &e.to_id, &e.relation])?;
+                }
+
+                let ledger_kind = if old_id.is_some() { "supersede" } else { "store" };
+                let ledger_id = ledger_append_in_tx(
+                    &mut tx,
+                    &qualified_ledger,
+                    &hmac_key,
+                    ledger_kind,
+                    &agent_uuid,
+                    &new_id,
+                    json!({
+                        "key": key,
+                        "content_sha256": content_hash,
+                        "supersedes": old_id,
+                        "source": source,
+                        "edges": edges.len(),
+                    }),
+                )?;
+
+                tx.commit()?;
+                Ok(Some((new_id, old_id, ledger_id)))
+            });
+
+            let Some((new_id, old_id, ledger_id)) = written? else {
+                anyhow::bail!(
+                    "supersede on key '{key}' which had no current belief; use store_belief for first assertions"
+                );
+            };
+            Ok(BeliefWritten {
+                id: new_id,
+                superseded_id: old_id,
+                ledger_id,
+            })
+        })
+        .await
+    }
+
+    /// Full version history of a key, oldest first.
+    pub async fn belief_timeline(&self, key: &str) -> Result<Vec<BeliefVersion>> {
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let key = key.to_string();
+
+        run_on_os_thread(move || -> Result<Vec<BeliefVersion>> {
+            let mut client = client.lock();
+            let stmt = format!(
+                "SELECT id, key, content, source, valid_from, valid_to, superseded_by
+                 FROM {qualified_table}
+                 WHERE key = $1
+                 ORDER BY valid_from ASC"
+            );
+            let rows = client.query(&stmt, &[&key])?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    let vf: DateTime<Utc> = r.get("valid_from");
+                    let vt: Option<DateTime<Utc>> = r.get("valid_to");
+                    BeliefVersion {
+                        id: r.get("id"),
+                        key: r.get("key"),
+                        content: r.get("content"),
+                        source: r.get("source"),
+                        valid_from: vf.to_rfc3339(),
+                        valid_to: vt.map(|t| t.to_rfc3339()),
+                        superseded_by: r.get("superseded_by"),
+                    }
+                })
+                .collect())
+        })
+        .await
+    }
+
+    /// What did the agent believe at time `asof`? Applicative bitemporality:
+    /// returns the versions whose validity window contains `asof`
+    /// (`valid_from <= asof < valid_to`), ranked by the same hybrid
+    /// keyword+vector fusion as [`Memory::recall`].
+    ///
+    /// This works for any `asof` since the schema was created — unlike
+    /// [`Self::get_asof_system_time`], it does not depend on MVCC garbage
+    /// collection.
+    pub async fn recall_asof(
+        &self,
+        query: &str,
+        asof_rfc3339: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        // Validate the timestamp before it goes anywhere near SQL.
+        let asof: DateTime<Utc> = asof_rfc3339
+            .parse()
+            .context("asof must be an RFC 3339 timestamp")?;
+        let asof_s = asof.to_rfc3339();
+
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let query = normalize_recent_recall_query(query).trim().to_string();
+        let query_vec = self.embed_query(&query).await;
+
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+            let mut client = client.lock();
+            let columns = CockroachMemory::entry_columns();
+            #[allow(clippy::cast_possible_wrap)]
+            let limit_i64 = limit as i64;
+            let window = "m.valid_from <= $2::TEXT::TIMESTAMPTZ
+                          AND (m.valid_to IS NULL OR m.valid_to > $2::TEXT::TIMESTAMPTZ)";
+
+            if query.is_empty() && query_vec.is_none() {
+                let stmt = format!(
+                    "SELECT {columns}, 0.0::FLOAT8 AS score
+                     FROM {qualified_table} m
+                     LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                     WHERE ($1 = '' OR true) AND {window}
+                     ORDER BY m.valid_from DESC
+                     LIMIT $3"
+                );
+                let rows = client.query(&stmt, &[&query, &asof_s, &limit_i64])?;
+                return rows
+                    .iter()
+                    .map(CockroachMemory::row_to_entry)
+                    .collect::<Result<Vec<MemoryEntry>>>();
+            }
+
+            let keyword_stmt = format!(
+                "SELECT {columns},
+                        (
+                          CASE WHEN to_tsvector('simple', translate(m.key, '_-', '  ')) @@ plainto_tsquery('simple', $1)
+                            THEN ts_rank(to_tsvector('simple', translate(m.key, '_-', '  ')), plainto_tsquery('simple', $1)) * 2.0
+                            ELSE 0.0 END +
+                          CASE WHEN to_tsvector('simple', m.content) @@ plainto_tsquery('simple', $1)
+                            THEN ts_rank(to_tsvector('simple', m.content), plainto_tsquery('simple', $1))
+                            ELSE 0.0 END
+                        )::FLOAT8 AS score
+                 FROM {qualified_table} m
+                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                 WHERE to_tsvector('simple', translate(m.key, '_-', '  ') || ' ' || m.content) @@ plainto_tsquery('simple', $1)
+                   AND {window}
+                 ORDER BY score DESC, m.valid_from DESC
+                 LIMIT $3"
+            );
+            let keyword_rows: Vec<Row> = if query.is_empty() {
+                Vec::new()
+            } else {
+                client.query(&keyword_stmt, &[&query, &asof_s, &limit_i64])?
+            };
+
+            let vector_rows: Vec<Row> = if let Some(qv) = query_vec.as_ref() {
+                let qlit = CockroachMemory::vector_literal(qv);
+                let stmt = format!(
+                    "SELECT {columns},
+                            (1.0 - (m.embedding <=> $1::TEXT::vector))::FLOAT8 AS score
+                     FROM {qualified_table} m
+                     LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                     WHERE m.embedding IS NOT NULL AND {window}
+                     ORDER BY m.embedding <=> $1::TEXT::vector
+                     LIMIT $3"
+                );
+                client.query(&stmt, &[&qlit, &asof_s, &limit_i64])?
+            } else {
+                Vec::new()
+            };
+
+            let mut entries: HashMap<String, MemoryEntry> = HashMap::new();
+            let mut keyword_scores: Vec<(String, f32)> = Vec::new();
+            for row in &keyword_rows {
+                let entry = CockroachMemory::row_to_entry(row)?;
+                #[allow(clippy::cast_possible_truncation)]
+                let s = entry.score.unwrap_or(0.0) as f32;
+                if s > 0.0 {
+                    keyword_scores.push((entry.id.clone(), s));
+                }
+                entries.insert(entry.id.clone(), entry);
+            }
+            let mut vector_scores: Vec<(String, f32)> = Vec::new();
+            for row in &vector_rows {
+                let entry = CockroachMemory::row_to_entry(row)?;
+                #[allow(clippy::cast_possible_truncation)]
+                let s = entry.score.unwrap_or(0.0) as f32;
+                vector_scores.push((entry.id.clone(), s));
+                entries.entry(entry.id.clone()).or_insert(entry);
+            }
+
+            let merged = hybrid_merge(
+                &vector_scores,
+                &keyword_scores,
+                VECTOR_WEIGHT,
+                KEYWORD_WEIGHT,
+                limit,
+            );
+            Ok(merged
+                .into_iter()
+                .filter_map(|scored| {
+                    entries.remove(&scored.id).map(|mut e| {
+                        e.score = Some(f64::from(scored.final_score));
+                        e
+                    })
+                })
+                .collect())
+        })
+        .await
+    }
+
+    /// MVCC time-travel read of a key's current row *as the database itself
+    /// stored it* at `asof`, via CockroachDB's `AS OF SYSTEM TIME`.
+    ///
+    /// Bounded by the cluster's MVCC garbage-collection window
+    /// (`gc.ttlseconds`, measured **14400 s = 4 h** on both the local v26.2.5
+    /// cluster and typical defaults) and errors if `asof` predates the
+    /// schema's creation. The applicative window ([`Self::recall_asof`])
+    /// covers the unbounded horizon; this covers the recent one from the
+    /// storage engine's own history — the two must agree, which is exactly
+    /// what makes it a good audit cross-check.
+    pub async fn get_asof_system_time(
+        &self,
+        key: &str,
+        asof_rfc3339: &str,
+    ) -> Result<Option<MemoryEntry>> {
+        let asof: DateTime<Utc> = asof_rfc3339
+            .parse()
+            .context("asof must be an RFC 3339 timestamp")?;
+        // Parsed and re-serialized before inlining: injection-safe.
+        let asof_lit = asof.to_rfc3339_opts(SecondsFormat::Micros, true);
+
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let key = key.to_string();
+
+        run_on_os_thread(move || -> Result<Option<MemoryEntry>> {
+            let mut client = client.lock();
+            // No agents JOIN: AS OF SYSTEM TIME applies per-statement and the
+            // single-table form is the one CockroachDB documents.
+            let stmt = format!(
+                "SELECT m.id, m.key, m.content, m.category, m.created_at,
+                        m.session_id, m.namespace, m.importance, m.superseded_by,
+                        m.kind, m.pinned, m.tenant_id,
+                        NULL::TEXT AS agent_alias, m.agent_id
+                 FROM {qualified_table} m AS OF SYSTEM TIME '{asof_lit}'
+                 WHERE m.key = $1 AND m.valid_to IS NULL
+                 LIMIT 1"
+            );
+            let row = client.query_opt(&stmt, &[&key])?;
+            row.as_ref().map(CockroachMemory::row_to_entry).transpose()
+        })
+        .await
+    }
+
+    /// All ledger entries, oldest first.
+    pub async fn ledger_entries(&self) -> Result<Vec<LedgerEntry>> {
+        let client = self.client.get().clone();
+        let qualified_ledger = self.qualified_ledger.clone();
+
+        run_on_os_thread(move || -> Result<Vec<LedgerEntry>> {
+            let mut client = client.lock();
+            let stmt = format!(
+                "SELECT id, ts, kind, actor, target, params, prev_hmac, hmac
+                 FROM {qualified_ledger} ORDER BY id ASC"
+            );
+            let rows = client.query(&stmt, &[])?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    let ts: DateTime<Utc> = r.get("ts");
+                    LedgerEntry {
+                        id: r.get("id"),
+                        ts: ts_micros_string(&ts),
+                        kind: r.get("kind"),
+                        actor: r.get("actor"),
+                        target: r.get("target"),
+                        params: r.get("params"),
+                        prev_hmac: r.get("prev_hmac"),
+                        hmac: r.get("hmac"),
+                    }
+                })
+                .collect())
+        })
+        .await
+    }
+
+    /// Verify the whole memory against its ledger:
+    ///
+    /// 1. **Chain**: recompute every entry's HMAC and linkage — catches any
+    ///    edit to the ledger itself.
+    /// 2. **Row cross-check**: every memory row's `content` hash must equal
+    ///    the `content_sha256` of the *latest* content-bearing ledger entry
+    ///    targeting it — catches direct `UPDATE`s to memory rows that
+    ///    bypassed the write path.
+    pub async fn verify_ledger(&self) -> Result<LedgerVerification> {
+        let entries = self.ledger_entries().await?;
+        let chain = ledger::verify_chain(&self.hmac_key, &entries);
+
+        // Latest committed content hash per row id.
+        let mut expected: HashMap<String, String> = HashMap::new();
+        for e in &entries {
+            if let Some(sha) = e.params.get("content_sha256").and_then(|v| v.as_str()) {
+                expected.insert(e.target.clone(), sha.to_string());
+            }
+        }
+
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let rows: Vec<(String, String, String)> =
+            run_on_os_thread(move || -> Result<Vec<(String, String, String)>> {
+                let mut client = client.lock();
+                let stmt = format!("SELECT id, key, content FROM {qualified_table}");
+                let rows = client.query(&stmt, &[])?;
+                Ok(rows
+                    .iter()
+                    .map(|r| (r.get(0), r.get(1), r.get(2)))
+                    .collect())
+            })
+            .await?;
+
+        let rows_checked = rows.len();
+        let mut row_mismatches = Vec::new();
+        for (id, key, content) in rows {
+            let Some(ledger_sha) = expected.get(&id) else {
+                // Row with no ledger entry at all: written before the ledger
+                // existed or inserted around the write path — flag it.
+                row_mismatches.push(RowMismatch {
+                    id,
+                    key,
+                    ledger_sha256: "<no ledger entry>".into(),
+                    row_sha256: content_sha256(&content),
+                });
+                continue;
+            };
+            let row_sha = content_sha256(&content);
+            if &row_sha != ledger_sha {
+                row_mismatches.push(RowMismatch {
+                    id,
+                    key,
+                    ledger_sha256: ledger_sha.clone(),
+                    row_sha256: row_sha,
+                });
+            }
+        }
+
+        Ok(LedgerVerification {
+            chain,
+            row_mismatches,
+            rows_checked,
+        })
+    }
+}
+
 #[async_trait]
 impl Memory for CockroachMemory {
     fn name(&self) -> &str {
@@ -681,7 +1381,7 @@ impl Memory for CockroachMemory {
                 SELECT {columns}
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                WHERE m.key = $1
+                WHERE m.key = $1 AND m.valid_to IS NULL
                 LIMIT 1
                 "
             );
@@ -707,7 +1407,7 @@ impl Memory for CockroachMemory {
                 SELECT {columns}
                 FROM {qualified_table} m
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                WHERE m.key = $1 AND m.agent_id = $2
+                WHERE m.key = $1 AND m.agent_id = $2 AND m.valid_to IS NULL
                 LIMIT 1
                 "
             );
@@ -739,6 +1439,7 @@ impl Memory for CockroachMemory {
                 LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
                 WHERE ($1::TEXT IS NULL OR m.category = $1)
                   AND ($2::TEXT IS NULL OR m.session_id = $2)
+                  AND m.valid_to IS NULL
                 ORDER BY m.updated_at DESC
                 "
             );
@@ -756,12 +1457,35 @@ impl Memory for CockroachMemory {
     async fn forget(&self, key: &str) -> Result<bool> {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
+        let qualified_ledger = self.qualified_ledger.clone();
+        let hmac_key = self.hmac_key.clone();
         let key = key.to_string();
 
         run_on_os_thread(move || -> Result<bool> {
             let mut client = client.lock();
-            let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1");
-            let deleted = with_txn_retry(|| client.execute(&stmt, &[&key]))?;
+            let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1 RETURNING id");
+            let deleted = with_txn_retry(|| {
+                let mut tx = client.transaction()?;
+                let ids: Vec<String> = tx
+                    .query(&stmt, &[&key])?
+                    .iter()
+                    .map(|r| r.get::<_, String>(0))
+                    .collect();
+                if !ids.is_empty() {
+                    ledger_append_in_tx(
+                        &mut tx,
+                        &qualified_ledger,
+                        &hmac_key,
+                        "forget",
+                        "system",
+                        "*",
+                        json!({ "key": key, "deleted_ids": ids }),
+                    )?;
+                }
+                let n = ids.len();
+                tx.commit()?;
+                Ok(n)
+            })?;
             Ok(deleted > 0)
         })
         .await
@@ -770,13 +1494,38 @@ impl Memory for CockroachMemory {
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> Result<bool> {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
+        let qualified_ledger = self.qualified_ledger.clone();
+        let hmac_key = self.hmac_key.clone();
         let key = key.to_string();
         let agent_id = agent_id.to_string();
 
         run_on_os_thread(move || -> Result<bool> {
             let mut client = client.lock();
-            let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1 AND agent_id = $2");
-            let deleted = with_txn_retry(|| client.execute(&stmt, &[&key, &agent_id]))?;
+            let stmt = format!(
+                "DELETE FROM {qualified_table} WHERE key = $1 AND agent_id = $2 RETURNING id"
+            );
+            let deleted = with_txn_retry(|| {
+                let mut tx = client.transaction()?;
+                let ids: Vec<String> = tx
+                    .query(&stmt, &[&key, &agent_id])?
+                    .iter()
+                    .map(|r| r.get::<_, String>(0))
+                    .collect();
+                if !ids.is_empty() {
+                    ledger_append_in_tx(
+                        &mut tx,
+                        &qualified_ledger,
+                        &hmac_key,
+                        "forget",
+                        &agent_id,
+                        "*",
+                        json!({ "key": key, "deleted_ids": ids }),
+                    )?;
+                }
+                let n = ids.len();
+                tx.commit()?;
+                Ok(n)
+            })?;
             Ok(deleted > 0)
         })
         .await
@@ -1077,6 +1826,8 @@ impl Memory for CockroachMemory {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
+        let qualified_ledger = self.qualified_ledger.clone();
+        let hmac_key = self.hmac_key.clone();
         let key = key.to_string();
         let content = content.to_string();
         let category = Self::category_to_str(&category);
@@ -1094,7 +1845,6 @@ impl Memory for CockroachMemory {
 
         let has_vector = self.dimensions > 0;
         run_on_os_thread(move || -> Result<()> {
-            let now = Utc::now();
             let mut client = client.lock();
             // The embedding column only exists when the backend was created
             // with a real embedder. `$14::TEXT::vector` (not `$14::vector`)
@@ -1105,16 +1855,22 @@ impl Memory for CockroachMemory {
             } else {
                 ("", "", "")
             };
+            // In-place upsert of the *current* version — the arbiter is the
+            // partial unique index, so belief history rows never conflict.
+            // This is the legacy non-versioned surface; `store_belief` /
+            // `supersede_belief` is the versioned one. valid_from is kept on
+            // update (an overwrite is not a supersession).
             let stmt = format!(
                 "
                 INSERT INTO {qualified_table}
                     (id, tenant_id, agent_id, namespace, key, content, category,
-                     kind, importance, pinned, session_id, created_at, updated_at{embedding_col})
+                     kind, importance, pinned, session_id, created_at, updated_at,
+                     valid_from{embedding_col})
                 VALUES
                     ($1, $2,
                      COALESCE($3, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)),
-                     $4, $5, $6, $7, $8, $9, $10, $11, $12, $13{embedding_val})
-                ON CONFLICT (agent_id, key) DO UPDATE SET
+                     $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $12{embedding_val})
+                ON CONFLICT (agent_id, key) WHERE valid_to IS NULL DO UPDATE SET
                     content = EXCLUDED.content,
                     category = EXCLUDED.category,
                     kind = EXCLUDED.kind,
@@ -1124,29 +1880,45 @@ impl Memory for CockroachMemory {
                     tenant_id = EXCLUDED.tenant_id,
                     session_id = EXCLUDED.session_id,
                     updated_at = EXCLUDED.updated_at{embedding_upd}
+                RETURNING id
                 "
             );
 
             let id = Uuid::new_v4().to_string();
-            let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
-                &id,
-                &tenant_id,
-                &aid,
-                &namespace,
-                &key,
-                &content,
-                &category,
-                &kind,
-                &importance,
-                &pinned,
-                &sid,
-                &now,
-                &now,
-            ];
-            if has_vector {
-                params.push(&embedding);
-            }
-            with_txn_retry(|| client.execute(&stmt, &params))?;
+            let content_hash = content_sha256(&content);
+            with_txn_retry(|| {
+                let now = Utc::now();
+                let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+                    &id,
+                    &tenant_id,
+                    &aid,
+                    &namespace,
+                    &key,
+                    &content,
+                    &category,
+                    &kind,
+                    &importance,
+                    &pinned,
+                    &sid,
+                    &now,
+                    &now,
+                ];
+                if has_vector {
+                    params.push(&embedding);
+                }
+                let mut tx = client.transaction()?;
+                let row_id: String = tx.query_one(&stmt, &params)?.get(0);
+                ledger_append_in_tx(
+                    &mut tx,
+                    &qualified_ledger,
+                    &hmac_key,
+                    "store",
+                    aid.as_deref().unwrap_or("default"),
+                    &row_id,
+                    json!({ "key": key, "content_sha256": content_hash }),
+                )?;
+                tx.commit()
+            })?;
             Ok(())
         })
         .await
