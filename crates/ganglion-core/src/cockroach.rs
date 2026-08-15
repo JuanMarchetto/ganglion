@@ -921,7 +921,7 @@ impl CockroachMemory {
                  WHERE id = $3"
             );
             let (embedding_col, embedding_val) = if has_vector {
-                (", embedding", ", $15::TEXT::vector")
+                (", embedding", ", $13::TEXT::vector")
             } else {
                 ("", "")
             };
