@@ -97,6 +97,19 @@ impl ConnFactory {
         if let Some(t) = self.connect_timeout {
             config.connect_timeout(t);
         }
+        // Failover hygiene. `docker kill` (SIGKILL) tears a node down without
+        // closing its sockets, so without these a client blocked on a query to
+        // the dead node waits out the kernel's default retransmit budget —
+        // tens of seconds — before it ever learns to reconnect. Keepalives
+        // probe an idle socket; tcp_user_timeout caps how long *unacknowledged
+        // data* may sit in flight, which is the case that actually bites here.
+        config
+            .keepalives(true)
+            .keepalives_idle(Duration::from_secs(5))
+            .keepalives_interval(Duration::from_secs(2))
+            .keepalives_retries(3)
+            .tcp_user_timeout(Duration::from_secs(10))
+            .application_name("ganglion");
         if self.wants_tls {
             let connector = native_tls::TlsConnector::new().context("failed to build TLS connector")?;
             config
@@ -904,12 +917,25 @@ fn with_txn_retry<T, F>(mut f: F) -> std::result::Result<T, postgres::Error>
 where
     F: FnMut() -> std::result::Result<T, postgres::Error>,
 {
+    const MAX_ATTEMPTS: u32 = 12;
     let mut attempt: u32 = 0;
     loop {
         match f() {
-            Err(e) if is_retryable(&e) && attempt < 7 => {
+            Err(e) if is_retryable(&e) && attempt < MAX_ATTEMPTS => {
                 attempt += 1;
-                std::thread::sleep(Duration::from_millis(15u64 << attempt));
+                // Cap the backoff: contention wants spacing, not seconds of
+                // sleep — 12 capped attempts is ~3.4s worst case.
+                std::thread::sleep(Duration::from_millis((15u64 << attempt).min(500)));
+            }
+            Err(e) if is_retryable(&e) => {
+                // Separates an honest "too much contention" rejection from a
+                // hole in `is_retryable` when reading chaos-run logs.
+                tracing::warn!(
+                    attempts = MAX_ATTEMPTS,
+                    error = %e,
+                    "retry budget exhausted on a retryable error; surfacing to caller"
+                );
+                return Err(e);
             }
             other => return other,
         }
@@ -1261,6 +1287,24 @@ impl CockroachMemory {
                 superseded_id: old_id,
                 ledger_id,
             })
+            })
+        })
+        .await
+    }
+
+    /// Cluster membership as the database itself sees it: (node_id, address,
+    /// is_live). Powers the demo's node panel; `crdb_internal` needs the
+    /// `allow_unsafe_internals` session variable on recent CockroachDB.
+    pub async fn cluster_nodes(&self) -> Result<Vec<(i64, String, bool)>> {
+        let client = self.client.get().clone();
+        run_on_os_thread(move || -> Result<Vec<(i64, String, bool)>> {
+            client.run(|client| {
+                client.batch_execute("SET allow_unsafe_internals = true")?;
+                let rows = client.query(
+                    "SELECT node_id::INT8, address, is_live FROM crdb_internal.gossip_nodes ORDER BY node_id",
+                    &[],
+                )?;
+                Ok(rows.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect())
             })
         })
         .await
