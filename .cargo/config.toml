@@ -1,0 +1,5 @@
+# Cap parallel codegen so a release build leaves the workstation usable.
+# The default (one job per core) saturated all 16 cores and, together with the
+# unbounded cluster, made the desktop unresponsive mid-sprint.
+[build]
+jobs = 8

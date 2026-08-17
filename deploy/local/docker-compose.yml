@@ -1,11 +1,22 @@
+# Resource caps are deliberate. A CockroachDB node defaults to 25% of host RAM
+# for its cache plus 25% for SQL memory, and will happily use every core; three
+# unbounded nodes on a workstation drove load average past 50 and made the
+# machine unusable during a chaos run. Each node is capped here at 2 cores and
+# 4 GiB, with --cache and --max-sql-memory pinned to absolute values instead of
+# host-relative percentages. That leaves >=10 of 16 cores for the human.
+x-roach: &roach
+  image: cockroachdb/cockroach:latest-v26.2
+  restart: unless-stopped
+  cpus: 2.0
+  mem_limit: 4g
+
 services:
   roach1:
-    image: cockroachdb/cockroach:latest-v26.2
+    <<: *roach
     hostname: roach1
-    command: start --insecure --join=roach1,roach2,roach3 --listen-addr=0.0.0.0:26257 --advertise-addr=roach1:26257 --http-addr=0.0.0.0:8080
+    command: start --insecure --join=roach1,roach2,roach3 --listen-addr=0.0.0.0:26257 --advertise-addr=roach1:26257 --http-addr=0.0.0.0:8080 --cache=512MiB --max-sql-memory=512MiB
     volumes:
       - roach1-data:/cockroach/cockroach-data
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 5s
@@ -13,20 +24,18 @@ services:
       retries: 20
 
   roach2:
-    image: cockroachdb/cockroach:latest-v26.2
+    <<: *roach
     hostname: roach2
-    command: start --insecure --join=roach1,roach2,roach3 --listen-addr=0.0.0.0:26257 --advertise-addr=roach2:26257 --http-addr=0.0.0.0:8080
+    command: start --insecure --join=roach1,roach2,roach3 --listen-addr=0.0.0.0:26257 --advertise-addr=roach2:26257 --http-addr=0.0.0.0:8080 --cache=512MiB --max-sql-memory=512MiB
     volumes:
       - roach2-data:/cockroach/cockroach-data
-    restart: unless-stopped
 
   roach3:
-    image: cockroachdb/cockroach:latest-v26.2
+    <<: *roach
     hostname: roach3
-    command: start --insecure --join=roach1,roach2,roach3 --listen-addr=0.0.0.0:26257 --advertise-addr=roach3:26257 --http-addr=0.0.0.0:8080
+    command: start --insecure --join=roach1,roach2,roach3 --listen-addr=0.0.0.0:26257 --advertise-addr=roach3:26257 --http-addr=0.0.0.0:8080 --cache=512MiB --max-sql-memory=512MiB
     volumes:
       - roach3-data:/cockroach/cockroach-data
-    restart: unless-stopped
 
   haproxy:
     image: haproxy:lts-alpine
@@ -40,6 +49,8 @@ services:
       - "26257:26257"   # SQL (load-balanced across the 3 nodes)
       - "8085:8080"     # DB Console
     restart: unless-stopped
+    cpus: 1.0
+    mem_limit: 512m
 
 volumes:
   roach1-data:
