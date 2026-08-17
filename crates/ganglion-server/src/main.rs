@@ -21,8 +21,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const UI: &str = include_str!("ui.html");
-/// Only these containers may ever be touched by the chaos endpoints.
-const CHAOS_ALLOWLIST: [&str; 3] = ["local-roach1-1", "local-roach2-1", "local-roach3-1"];
+
+/// The only containers the chaos endpoints may ever touch. Compiled in, not
+/// configurable: an operator-supplied allowlist is one env var away from
+/// being an arbitrary remote docker executor.
+///
+/// Both prefixes are present because compose names containers
+/// `<project>-<service>-<index>` and the two stacks use different project
+/// names — `local` for `deploy/local`, `ganglion` for
+/// `deploy/aws/docker-compose.prod.yml`. Listing both keeps the same binary
+/// working in either without widening what it can reach.
+const CHAOS_ALLOWLIST: [&str; 6] = [
+    "local-roach1-1",
+    "local-roach2-1",
+    "local-roach3-1",
+    "ganglion-roach1-1",
+    "ganglion-roach2-1",
+    "ganglion-roach3-1",
+];
 
 struct App {
     memory: CockroachMemory,

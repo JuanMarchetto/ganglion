@@ -1,0 +1,126 @@
+# Ganglion production stack: the memory layer and its database on one EC2 host.
+#
+#   app     — ganglion-server (JSON API + embedded UI), never published directly
+#   roach1-3 — a 3-node CockroachDB cluster, the memory itself
+#   haproxy — SQL load balancer; the reason killing a node is survivable
+#   caddy   — TLS terminator, the only container with a public port
+#
+# Everything is on a private bridge network. Only caddy binds 80/443, so the
+# database, its console and the app are unreachable from the internet except
+# through Caddy. See README.md for the full deploy procedure.
+
+name: ganglion
+
+services:
+  roach1:
+    image: cockroachdb/cockroach:latest-v26.2
+    hostname: roach1
+    command: >
+      start --insecure --join=roach1,roach2,roach3
+      --listen-addr=0.0.0.0:26257 --advertise-addr=roach1:26257
+      --http-addr=0.0.0.0:8080
+      --cache=.25 --max-sql-memory=.25
+    volumes:
+      - roach1-data:/cockroach/cockroach-data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  roach2:
+    image: cockroachdb/cockroach:latest-v26.2
+    hostname: roach2
+    command: >
+      start --insecure --join=roach1,roach2,roach3
+      --listen-addr=0.0.0.0:26257 --advertise-addr=roach2:26257
+      --http-addr=0.0.0.0:8080
+      --cache=.25 --max-sql-memory=.25
+    volumes:
+      - roach2-data:/cockroach/cockroach-data
+    restart: unless-stopped
+
+  roach3:
+    image: cockroachdb/cockroach:latest-v26.2
+    hostname: roach3
+    command: >
+      start --insecure --join=roach1,roach2,roach3
+      --listen-addr=0.0.0.0:26257 --advertise-addr=roach3:26257
+      --http-addr=0.0.0.0:8080
+      --cache=.25 --max-sql-memory=.25
+    volumes:
+      - roach3-data:/cockroach/cockroach-data
+    restart: unless-stopped
+
+  # One-shot: initialise the cluster and create the database, then exit.
+  # Safe to re-run — `init` on an initialised cluster is a no-op error we drop.
+  init:
+    image: cockroachdb/cockroach:latest-v26.2
+    depends_on:
+      roach1:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "./cockroach init --insecure --host=roach1:26257 || true;
+       ./cockroach sql --insecure --host=roach1:26257
+         -e 'CREATE DATABASE IF NOT EXISTS ganglion'"
+
+  haproxy:
+    image: haproxy:lts-alpine
+    depends_on: [roach1, roach2, roach3]
+    volumes:
+      # Reuses the local config verbatim: the `on-marked-down
+      # shutdown-sessions` directive there is what bounds failover.
+      - ../local/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    restart: unless-stopped
+
+  app:
+    build:
+      context: ../..
+      dockerfile: deploy/aws/Dockerfile
+    depends_on: [haproxy, init]
+    environment:
+      GANGLION_DSN: postgresql://root@haproxy:26257/ganglion?sslmode=disable
+      GANGLION_SCHEMA: demo
+      GANGLION_AGENT_ALIAS: demo-agent
+      PORT: "3000"
+      # Signs the tamper-evident ledger. MUST be set in .env — without it the
+      # server falls back to a built-in dev key and the ledger proves nothing
+      # against an attacker who knows the source.
+      GANGLION_HMAC_KEY: ${GANGLION_HMAC_KEY:?set GANGLION_HMAC_KEY in .env}
+      # Gate for the live kill-node demo. Both must be set for /api/chaos/*
+      # to answer at all, and it only ever touches the container allowlist
+      # compiled into the binary.
+      GANGLION_ENABLE_CHAOS: ${GANGLION_ENABLE_CHAOS:-0}
+      GANGLION_ADMIN_TOKEN: ${GANGLION_ADMIN_TOKEN:-}
+      GANGLION_POOL_SIZE: "16"
+    volumes:
+      # Only needed when GANGLION_ENABLE_CHAOS=1: the kill button shells out to
+      # `docker kill` against the allowlisted node containers. This grants the
+      # app control of the host's Docker daemon — a deliberate demo-only
+      # trade. Comment it out and the API still runs; only the button dies.
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on: [app]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data      # persists the issued certificate across restarts
+      - caddy-config:/config
+    environment:
+      GANGLION_DOMAIN: ${GANGLION_DOMAIN:?set GANGLION_DOMAIN in .env}
+    restart: unless-stopped
+
+volumes:
+  roach1-data:
+  roach2-data:
+  roach3-data:
+  caddy-data:
+  caddy-config:

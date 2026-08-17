@@ -1,0 +1,24 @@
+# Caddy fetches and renews a Let's Encrypt certificate automatically, on the
+# strength of the domain resolving to this host and ports 80/443 being open.
+# There is no certbot step and no cron renewal to forget.
+
+{$GANGLION_DOMAIN} {
+	encode gzip
+
+	# The DB Console is useful on camera (you can watch the cluster lose a
+	# node) but it is unauthenticated in an --insecure cluster, so it is not
+	# exposed here. To publish it for a demo, uncomment and put a basicauth
+	# block in front of it:
+	#
+	# handle_path /console/* {
+	#     basicauth { admin <bcrypt-hash> }
+	#     reverse_proxy haproxy:8080
+	# }
+
+	reverse_proxy app:3000
+
+	log {
+		output stdout
+		format console
+	}
+}
