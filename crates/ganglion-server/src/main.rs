@@ -336,16 +336,18 @@ async fn api_nodes(State(app): State<Arc<App>>) -> Response {
     let docker = tokio::task::spawn_blocking(|| {
         CHAOS_ALLOWLIST
             .iter()
-            .map(|name| {
+            // The allowlist spans both compose projects (local and aws), so on
+            // any one host half of it does not exist. `docker inspect` failing
+            // means "not this deployment", not "node down" — skip those rather
+            // than render phantom cards next to the real nodes.
+            .filter_map(|name| {
                 let out = Command::new("docker")
                     .args(["inspect", "-f", "{{.State.Status}}", name])
-                    .output();
-                let status = out
+                    .output()
                     .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap_or_else(|| "unknown".into());
-                json!({ "container": name, "status": status })
+                    .filter(|o| o.status.success())?;
+                let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                Some(json!({ "container": name, "status": status }))
             })
             .collect::<Vec<_>>()
     })
