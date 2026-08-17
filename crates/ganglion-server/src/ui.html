@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ganglion — Unkillable Agent Memory</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #121722; --line: #1f2937; --text: #d7dde8;
+    --dim: #8b94a7; --green: #34d399; --red: #f87171; --amber: #fbbf24;
+    --accent: #7dd3fc;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.5 "JetBrains Mono", ui-monospace, monospace;
+    padding: 18px; min-height: 100vh;
+  }
+  header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 16px; }
+  h1 { font-size: 20px; letter-spacing: 1px; }
+  h1 span { color: var(--accent); }
+  header small { color: var(--dim); }
+  .grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 14px; }
+  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 14px;
+  }
+  .card h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 2px;
+    color: var(--dim); margin-bottom: 10px;
+  }
+  input, button {
+    background: #0d1220; color: var(--text); border: 1px solid var(--line);
+    border-radius: 5px; padding: 7px 9px; font: inherit;
+  }
+  input:focus { outline: 1px solid var(--accent); }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.danger { border-color: #7f1d1d; color: var(--red); }
+  button.danger:hover { background: #7f1d1d22; }
+  .row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .row input[type=text] { flex: 1; min-width: 120px; }
+  .log { margin-top: 8px; max-height: 300px; overflow-y: auto; }
+  .hit, .ver {
+    border-left: 3px solid var(--line); padding: 5px 9px; margin: 6px 0;
+    background: #0d1220; border-radius: 0 5px 5px 0; word-break: break-word;
+  }
+  .hit b { color: var(--accent); }
+  .hit .score { color: var(--dim); float: right; }
+  .ver.current { border-left-color: var(--green); }
+  .ver.superseded { border-left-color: var(--line); color: var(--dim); }
+  .ver.superseded .content { text-decoration: line-through; }
+  .ver .win { color: var(--dim); font-size: 12px; }
+  .nodes { display: flex; gap: 10px; flex-wrap: wrap; }
+  .node {
+    flex: 1; min-width: 130px; text-align: center; padding: 10px;
+    border: 1px solid var(--line); border-radius: 6px; background: #0d1220;
+  }
+  .node .dot { font-size: 22px; }
+  .node.up .dot { color: var(--green); }
+  .node.down .dot { color: var(--red); }
+  .node .name { font-size: 12px; color: var(--dim); }
+  .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .metric { background: #0d1220; border: 1px solid var(--line); border-radius: 6px; padding: 8px; text-align: center; }
+  .metric .v { font-size: 18px; color: var(--accent); }
+  .metric .l { font-size: 11px; color: var(--dim); }
+  .status { margin-top: 8px; min-height: 20px; color: var(--dim); word-break: break-word; }
+  .ok { color: var(--green); } .bad { color: var(--red); } .warn { color: var(--amber); }
+  .verify-box { font-size: 13px; }
+  .banner {
+    display: none; margin-bottom: 14px; padding: 10px 14px; border-radius: 6px;
+    border: 1px solid #7f1d1d; background: #7f1d1d22; color: var(--red);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>GANGLION<span>_</span></h1>
+  <small>unkillable agent memory on CockroachDB — a cockroach survives decapitation because its nervous system is distributed</small>
+</header>
+<div class="banner" id="banner">⚡ node down — memory still answering</div>
+
+<div class="grid">
+  <div>
+    <div class="card">
+      <h2>Remember / Recall</h2>
+      <div class="row">
+        <input type="text" id="r-key" placeholder="key (e.g. deploy_window)" style="max-width:200px">
+        <input type="text" id="r-content" placeholder="belief (e.g. We deploy Fridays at 14:00 UTC)">
+        <button onclick="remember()">remember</button>
+      </div>
+      <div class="row">
+        <input type="text" id="q" placeholder="query (e.g. when do we deploy?)">
+        <button onclick="recall()">recall</button>
+        <input type="text" id="asof" placeholder="as-of RFC3339 (optional)" style="max-width:230px">
+      </div>
+      <div class="status" id="rr-status"></div>
+      <div class="log" id="hits"></div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h2>Belief timeline <span style="text-transform:none;color:var(--dim)">— what did the agent believe, and when?</span></h2>
+      <div class="row">
+        <input type="text" id="t-key" placeholder="key">
+        <button onclick="timeline()">timeline</button>
+      </div>
+      <div class="log" id="tl"></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h2>Cluster — kill a node, memory survives</h2>
+      <div class="nodes" id="nodes"></div>
+      <div class="row" style="margin-top:10px">
+        <input type="password" id="token" placeholder="admin token" style="max-width:180px">
+        <span class="status" id="chaos-status"></span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h2>Live metrics</h2>
+      <div class="metrics" id="metrics"></div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h2>Tamper-evident ledger</h2>
+      <div class="row"><button onclick="verify()">verify HMAC chains + row hashes</button></div>
+      <div class="verify-box status" id="verify"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function api(path, body, method) {
+  const opts = { method: method || (body ? 'POST' : 'GET'), headers: {'Content-Type':'application/json'} };
+  const tok = $('token').value;
+  if (tok) opts.headers['Authorization'] = 'Bearer ' + tok;
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+async function remember() {
+  const key = $('r-key').value.trim(), content = $('r-content').value.trim();
+  if (!key || !content) return;
+  try {
+    const w = await api('/api/remember', { key, content, source: 'demo-ui' });
+    $('rr-status').innerHTML = `<span class="ok">✔ ${w.action}</span> ledger #${w.ledger_id} · ${w.latency_ms.toFixed(1)} ms`;
+    $('r-content').value = '';
+    if ($('t-key').value === key || !$('t-key').value) { $('t-key').value = key; timeline(); }
+  } catch (e) { $('rr-status').innerHTML = `<span class="bad">✘ ${esc(e.message)}</span>`; }
+}
+
+async function recall() {
+  const query = $('q').value.trim(); if (!query) return;
+  const asof = $('asof').value.trim();
+  try {
+    const res = asof
+      ? await api('/api/recall_asof', { query, asof })
+      : await api('/api/recall', { query });
+    const hits = res.hits || [];
+    $('rr-status').innerHTML = asof
+      ? `<span class="warn">⏳ as of ${esc(asof)}</span> — ${hits.length} beliefs held then`
+      : `<span class="ok">✔ ${hits.length} hits</span> · ${res.latency_ms ? res.latency_ms.toFixed(1) + ' ms' : ''}`;
+    $('hits').innerHTML = hits.map(h =>
+      `<div class="hit"><span class="score">${(h.score ?? 0).toFixed(3)}</span><b>${esc(h.key)}</b><br>${esc(h.content)}</div>`
+    ).join('') || '<div class="hit">no results</div>';
+  } catch (e) { $('rr-status').innerHTML = `<span class="bad">✘ ${esc(e.message)}</span>`; }
+}
+
+async function timeline() {
+  const key = $('t-key').value.trim(); if (!key) return;
+  try {
+    const res = await api('/api/timeline/' + encodeURIComponent(key));
+    $('tl').innerHTML = (res.versions || []).map(v => {
+      const cur = !v.valid_to;
+      return `<div class="ver ${cur ? 'current' : 'superseded'}">
+        <span class="content">${esc(v.content)}</span><br>
+        <span class="win">${cur ? 'CURRENT' : 'superseded'} · valid ${esc(v.valid_from)} → ${esc(v.valid_to || 'now')}${v.source ? ' · src: ' + esc(v.source) : ''}</span>
+      </div>`;
+    }).join('') || '<div class="ver">no versions</div>';
+  } catch (e) { $('tl').innerHTML = `<div class="ver bad">${esc(e.message)}</div>`; }
+}
+
+async function verify() {
+  $('verify').textContent = 'verifying…';
+  try {
+    const v = await api('/api/verify');
+    const chains = v.chains || [];
+    const broken = chains.filter(c => !c.valid);
+    $('verify').innerHTML = v.clean
+      ? `<span class="ok">✔ CLEAN</span> — ${v.entries_checked} ledger entries across ${chains.length} chains verified, ${v.rows_checked} rows cross-checked, 0 mismatches`
+      : `<span class="bad">✘ TAMPERING DETECTED</span> — ${broken.length ? 'chain broken at id ' + broken.map(c => c.broken_at).join(', ') : ''} ${(v.row_mismatches||[]).map(m => `<br>row <b>${esc(m.key)}</b> (${esc(m.id).slice(0,8)}…) hash mismatch`).join('')}`;
+  } catch (e) { $('verify').innerHTML = `<span class="bad">✘ ${esc(e.message)}</span>`; }
+}
+
+async function chaos(action, node) {
+  $('chaos-status').innerHTML = `<span class="warn">${action}ing ${esc(node)}…</span>`;
+  try {
+    await api('/api/chaos/' + action, { node });
+    $('chaos-status').innerHTML = `<span class="${action === 'kill' ? 'bad' : 'ok'}">${action === 'kill' ? '☠' : '✔'} ${esc(node)} ${action}ed</span>`;
+  } catch (e) { $('chaos-status').innerHTML = `<span class="bad">✘ ${esc(e.message)}</span>`; }
+}
+
+async function poll() {
+  try {
+    const n = await api('/api/nodes');
+    const anyDown = (n.docker || []).some(d => d.status !== 'running');
+    $('banner').style.display = anyDown ? 'block' : 'none';
+    $('nodes').innerHTML = (n.docker || []).map((d, i) => {
+      const up = d.status === 'running';
+      const g = (n.sql_gossip || [])[i];
+      return `<div class="node ${up ? 'up' : 'down'}">
+        <div class="dot">●</div>
+        <div class="name">${esc(d.container)}<br>${esc(d.status)}${g ? ' · gossip: ' + (g.is_live ? 'live' : 'dead') : ''}</div>
+        <div style="margin-top:6px">
+          ${up ? `<button class="danger" onclick="chaos('kill', '${esc(d.container)}')">KILL</button>`
+               : `<button onclick="chaos('revive', '${esc(d.container)}')">revive</button>`}
+        </div>
+      </div>`;
+    }).join('');
+  } catch (e) { /* nodes endpoint down: keep last state */ }
+  try {
+    const m = await api('/api/metrics');
+    const f = x => x == null ? '—' : x.toFixed(1);
+    $('metrics').innerHTML = `
+      <div class="metric"><div class="v">${m.remembers}</div><div class="l">writes</div></div>
+      <div class="metric"><div class="v">${m.recalls}</div><div class="l">recalls</div></div>
+      <div class="metric"><div class="v">${f(m.remember_p50_ms)}</div><div class="l">write p50 ms</div></div>
+      <div class="metric"><div class="v">${f(m.recall_p50_ms)}</div><div class="l">recall p50 ms</div></div>`;
+  } catch (e) {}
+}
+setInterval(poll, 2000); poll();
+['r-content','q','t-key'].forEach(id => $(id).addEventListener('keydown', e => {
+  if (e.key === 'Enter') ({ 'r-content': remember, 'q': recall, 't-key': timeline })[id]();
+}));
+</script>
+</body>
+</html>
