@@ -21,6 +21,42 @@ No memory framework (Mem0, Zep, Letta, Cognee) can offer that atomicity, because
 - Exposed via **MCP** (`remember`, `recall`, `recall_asof`, `supersede`, `verify_ledger`) so any MCP-capable agent can plug in.
 - Survives node failure live: 3-node CockroachDB cluster behind haproxy; kill a node mid-conversation, zero memories lost.
 
+## Run it
+
+Needs Docker and a Rust toolchain. Nothing else — the UI is compiled into the
+binary, so there is no build step and no node_modules.
+
+```sh
+deploy/local/up.sh                    # 3-node CockroachDB cluster + haproxy
+cargo run --release -p ganglion-server
+```
+
+Open <http://localhost:3000>. First boot against a new schema creates the
+tables and builds the vector index before the server answers anything —
+measured between 40s and a couple of minutes, since the DDL waits on a
+background index job. Restarts against an existing schema are immediate.
+
+To enable the KILL NODE button, give it a token and turn chaos on:
+
+```sh
+GANGLION_ENABLE_CHAOS=1 GANGLION_ADMIN_TOKEN=$(openssl rand -hex 24) \
+  cargo run --release -p ganglion-server
+```
+
+Paste the token into the UI's *admin token* field. Without both the env flag
+and a matching token the chaos endpoints refuse every request, and they only
+ever act on a fixed allowlist of node containers compiled into the binary.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GANGLION_DSN` | local haproxy | CockroachDB connection string |
+| `GANGLION_SCHEMA` | `demo` | schema to create/use |
+| `GANGLION_HMAC_KEY` | dev key (warns) | signs the ledger — set it for real use |
+| `GANGLION_ENABLE_CHAOS` | off | enables `/api/chaos/*` |
+| `GANGLION_ADMIN_TOKEN` | none | bearer token for `/api/chaos/*` |
+| `GANGLION_POOL_SIZE` | 8 | SQL connections |
+| `PORT` | 3000 | HTTP port |
+
 ## Measured, not claimed
 
 "Survives node failure" is a testable statement, so it is tested. The harness
